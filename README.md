@@ -22,6 +22,12 @@ developer or publisher.
   another layer. Fixes inspired by it were written anew in VIctory's code.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
+## Linux lab
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) to join the lab and
+[the task list](docs/lab/tasks.md) for open work. The Windows results below
+come from the source fork. The lab has yet to verify gameplay under Proton.
+
 ## Status of this fork (2026-11-25)
 
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**

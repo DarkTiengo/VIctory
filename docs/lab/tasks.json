@@ -1,0 +1,190 @@
+[
+  {
+    "id": "LAB-01",
+    "title": "[LAB-01] Reproduce Linux cross-build and Windows validation",
+    "scope": [
+      "New scripts/ and CI files",
+      "Cargo.lock and rust-toolchain.toml only when a demonstrated build defect requires it"
+    ],
+    "problem": "Our XCL cross-build worked, but VIctory uses Rust 1.98.1, a different workspace and different dependencies. No VIctory build has been verified in this lab.",
+    "steps": [
+      "Pin the cargo-xwin image by digest and use the repository's Rust toolchain and lockfile.",
+      "Run native Linux workspace tests and cross-build x86_64-pc-windows-msvc; retain separate logs and executable SHA-256.",
+      "Document Windows test execution, including fixture build requirements. Keep runtime testing separate."
+    ],
+    "acceptance": [
+      "A clean checkout builds reproducibly with recorded tool/image identities.",
+      "Linux tests and Windows builds have distinct results; no claim of Proton or gameplay success.",
+      "No host-wide package changes and no game data required."
+    ],
+    "dependencies": [],
+    "body": "Development base: Marvisak/VIctory at 1dd7afd4e68300e5dea41cd33a6e0b297798bb2f.\n\nOur XCL cross-build worked, but VIctory uses Rust 1.98.1, a different workspace and different dependencies. No VIctory build has been verified in this lab.\n\n## Ownership\n\nUnclaimed. Comment to claim this task and name the files/functions you will edit. Submit one focused PR and coordinate shared files before changing them.\n\n## Scope\n\n- New scripts/ and CI files\n- Cargo.lock and rust-toolchain.toml only when a demonstrated build defect requires it\n\n## Work\n\n1. Pin the cargo-xwin image by digest and use the repository's Rust toolchain and lockfile.\n2. Run native Linux workspace tests and cross-build x86_64-pc-windows-msvc; retain separate logs and executable SHA-256.\n3. Document Windows test execution, including fixture build requirements. Keep runtime testing separate.\n\n## Done when\n\n- [ ] A clean checkout builds reproducibly with recorded tool/image identities.\n- [ ] Linux tests and Windows builds have distinct results; no claim of Proton or gameplay success.\n- [ ] No host-wide package changes and no game data required.\n\n## Dependencies\n\nCan start independently.\n\n## Validation record\n\nInclude commit, toolchain, OS, GPU/driver when relevant, exact commands, exit codes and bounded logs. State checks not run. Never attach game files, derived shaders, memory dumps, credentials or SSH details. Linux gameplay and the performance target remain unverified.\n\nFollow CONTRIBUTING.md and docs/asset-policy.md.\n\n<!-- victory-lab-task:LAB-01 -->\n"
+  },
+  {
+    "id": "LAB-02",
+    "title": "[LAB-02] Validate the loader and runtime services under Proton",
+    "scope": [
+      "crates/victory-loader/",
+      "crates/victory-hle/ runtime/host services",
+      "tests/fixtures/hle-probe/"
+    ],
+    "problem": "VIctory executes titles through Windows APIs. Native Linux run is explicitly unsupported; Proton compatibility has not been established.",
+    "steps": [
+      "Start with an isolated Proton prefix and version/config CLI checks, then the repository's synthetic loader fixture.",
+      "Exercise imports, delay loads, TLS callbacks, new threads, unload and exceptions. Record Wine/Proton versions and exit statuses.",
+      "Identify unavailable host services and propose narrow HLE replacements only for demonstrated failures."
+    ],
+    "acceptance": [
+      "Synthetic fixture results under Proton, with complete command lines and exit status.",
+      "Original fixtures and game data remain unchanged.",
+      "Do not run the commercial title as a substitute for loader regression tests."
+    ],
+    "dependencies": [
+      "LAB-01 build output"
+    ],
+    "body": "Development base: Marvisak/VIctory at 1dd7afd4e68300e5dea41cd33a6e0b297798bb2f.\n\nVIctory executes titles through Windows APIs. Native Linux run is explicitly unsupported; Proton compatibility has not been established.\n\n## Ownership\n\nUnclaimed. Comment to claim this task and name the files/functions you will edit. Submit one focused PR and coordinate shared files before changing them.\n\n## Scope\n\n- crates/victory-loader/\n- crates/victory-hle/ runtime/host services\n- tests/fixtures/hle-probe/\n\n## Work\n\n1. Start with an isolated Proton prefix and version/config CLI checks, then the repository's synthetic loader fixture.\n2. Exercise imports, delay loads, TLS callbacks, new threads, unload and exceptions. Record Wine/Proton versions and exit statuses.\n3. Identify unavailable host services and propose narrow HLE replacements only for demonstrated failures.\n\n## Done when\n\n- [ ] Synthetic fixture results under Proton, with complete command lines and exit status.\n- [ ] Original fixtures and game data remain unchanged.\n- [ ] Do not run the commercial title as a substitute for loader regression tests.\n\n## Dependencies\n\n- LAB-01 build output\n\n## Validation record\n\nInclude commit, toolchain, OS, GPU/driver when relevant, exact commands, exit codes and bounded logs. State checks not run. Never attach game files, derived shaders, memory dumps, credentials or SSH details. Linux gameplay and the performance target remain unverified.\n\nFollow CONTRIBUTING.md and docs/asset-policy.md.\n\n<!-- victory-lab-task:LAB-02 -->\n"
+  },
+  {
+    "id": "LAB-03",
+    "title": "[LAB-03] Add D3D12 conformance probes for vkd3d and RX 9070 XT",
+    "scope": [
+      "New synthetic GPU tests",
+      "Minimal test seams in crates/victory-gpu/ coordinated with LAB-06"
+    ],
+    "problem": "The previous XCL base aborts because an internal heap's vtable was replaced. VIctory separates console and host objects; verify that this boundary works under vkd3d rather than assuming it.",
+    "steps": [
+      "Test native heap QueryInterface/AddRef/GetDesc/Release and placed/tiled resource paths without mutating host vtables.",
+      "Copy known data through a GPU resource and compare readback bytes.",
+      "Render a synthetic triangle and verify pixels; record selected adapter, feature level, shader model, mesh and wave-size support."
+    ],
+    "acceptance": [
+      "All probes execute on the intended AMD adapter under Proton/vkd3d.",
+      "The triangle and readback are checked, not inferred from successful device creation.",
+      "No disabled assertions or skipped failing GPU checks are reported as passing."
+    ],
+    "dependencies": [
+      "LAB-01",
+      "Coordinate production GPU edits with LAB-06"
+    ],
+    "body": "Development base: Marvisak/VIctory at 1dd7afd4e68300e5dea41cd33a6e0b297798bb2f.\n\nThe previous XCL base aborts because an internal heap's vtable was replaced. VIctory separates console and host objects; verify that this boundary works under vkd3d rather than assuming it.\n\n## Ownership\n\nUnclaimed. Comment to claim this task and name the files/functions you will edit. Submit one focused PR and coordinate shared files before changing them.\n\n## Scope\n\n- New synthetic GPU tests\n- Minimal test seams in crates/victory-gpu/ coordinated with LAB-06\n\n## Work\n\n1. Test native heap QueryInterface/AddRef/GetDesc/Release and placed/tiled resource paths without mutating host vtables.\n2. Copy known data through a GPU resource and compare readback bytes.\n3. Render a synthetic triangle and verify pixels; record selected adapter, feature level, shader model, mesh and wave-size support.\n\n## Done when\n\n- [ ] All probes execute on the intended AMD adapter under Proton/vkd3d.\n- [ ] The triangle and readback are checked, not inferred from successful device creation.\n- [ ] No disabled assertions or skipped failing GPU checks are reported as passing.\n\n## Dependencies\n\n- LAB-01\n- Coordinate production GPU edits with LAB-06\n\n## Validation record\n\nInclude commit, toolchain, OS, GPU/driver when relevant, exact commands, exit codes and bounded logs. State checks not run. Never attach game files, derived shaders, memory dumps, credentials or SSH details. Linux gameplay and the performance target remain unverified.\n\nFollow CONTRIBUTING.md and docs/asset-policy.md.\n\n<!-- victory-lab-task:LAB-03 -->\n"
+  },
+  {
+    "id": "LAB-04",
+    "title": "[LAB-04] Implement missing shader operations with explicit wave capability checks",
+    "scope": [
+      "crates/victory-shader/src/emit/lower.rs reserved functions",
+      "crates/victory-shader/src/gfx10/",
+      "Host capability checks coordinated with LAB-06"
+    ],
+    "problem": "Upstream reports unsupported 64-bit image atomics, merged stages and compute shaders requiring wave64. These limitations block world rendering.",
+    "steps": [
+      "Choose one unsupported operation at a time; document exact integer, mask and memory semantics from primary ISA documentation.",
+      "Add small synthetic programs covering normal, boundary and masked-lane cases.",
+      "Check host wave capability before pipeline creation and report unsupported cases explicitly."
+    ],
+    "acceptance": [
+      "A focused semantic regression fails before the fix and passes after it.",
+      "Compiler validation and hardware execution results are reported separately.",
+      "No zero-return stubs or dropped operations count as implemented."
+    ],
+    "dependencies": [
+      "Reserve lower.rs functions with LAB-05",
+      "Hardware execution requires LAB-03"
+    ],
+    "body": "Development base: Marvisak/VIctory at 1dd7afd4e68300e5dea41cd33a6e0b297798bb2f.\n\nUpstream reports unsupported 64-bit image atomics, merged stages and compute shaders requiring wave64. These limitations block world rendering.\n\n## Ownership\n\nUnclaimed. Comment to claim this task and name the files/functions you will edit. Submit one focused PR and coordinate shared files before changing them.\n\n## Scope\n\n- crates/victory-shader/src/emit/lower.rs reserved functions\n- crates/victory-shader/src/gfx10/\n- Host capability checks coordinated with LAB-06\n\n## Work\n\n1. Choose one unsupported operation at a time; document exact integer, mask and memory semantics from primary ISA documentation.\n2. Add small synthetic programs covering normal, boundary and masked-lane cases.\n3. Check host wave capability before pipeline creation and report unsupported cases explicitly.\n\n## Done when\n\n- [ ] A focused semantic regression fails before the fix and passes after it.\n- [ ] Compiler validation and hardware execution results are reported separately.\n- [ ] No zero-return stubs or dropped operations count as implemented.\n\n## Dependencies\n\n- Reserve lower.rs functions with LAB-05\n- Hardware execution requires LAB-03\n\n## Validation record\n\nInclude commit, toolchain, OS, GPU/driver when relevant, exact commands, exit codes and bounded logs. State checks not run. Never attach game files, derived shaders, memory dumps, credentials or SSH details. Linux gameplay and the performance target remain unverified.\n\nFollow CONTRIBUTING.md and docs/asset-policy.md.\n\n<!-- victory-lab-task:LAB-04 -->\n"
+  },
+  {
+    "id": "LAB-05",
+    "title": "[LAB-05] Validate upstream shader numerical fixes and remaining float-mode gaps",
+    "scope": [
+      "crates/victory-shader/src/emit/lower.rs reserved functions",
+      "crates/victory-shader/src/emit/diff_tests.rs"
+    ],
+    "problem": "Upstream issue #2 documents med3 NaN, fract rounding and signed BFE differences. PR #13 already addresses signed BFE, so avoid a duplicate implementation.",
+    "steps": [
+      "Review Marvisak/VIctory#2 and #13 at the current upstream revision before changing code.",
+      "Add synthetic NaN permutations and fract inputs near 1.0; distinguish f16 and f32 behavior.",
+      "Reuse an upstream merged fix when available, preserving attribution, and document any remaining differences."
+    ],
+    "acceptance": [
+      "Exact expected bit patterns and references accompany the cases.",
+      "The signed-BFE work is coordinated with the existing PR rather than independently duplicated.",
+      "Report actual compiler/hardware tests; pure IR tests are labelled as such."
+    ],
+    "dependencies": [
+      "Reserve lower.rs functions with LAB-04"
+    ],
+    "body": "Development base: Marvisak/VIctory at 1dd7afd4e68300e5dea41cd33a6e0b297798bb2f.\n\nUpstream commits 36eb0b4 and 0b499d7 already fix med3 NaN, fract, signed BFE and trigonometric range reduction. Validate those fixes under the chosen compiler/backend. Remaining legacy multiply denormal behavior needs the float-mode register; do not reimplement completed work.\n\n## Ownership\n\nUnclaimed. Comment to claim this task and name the files/functions you will edit. Submit one focused PR and coordinate shared files before changing them.\n\n## Scope\n\n- crates/victory-shader/src/emit/lower.rs reserved functions\n- crates/victory-shader/src/emit/diff_tests.rs\n\n## Work\n\n1. Review Marvisak/VIctory#2, #13 and commits 36eb0b4/0b499d7 before changing code; report which expected values are covered.\n2. Exercise synthetic NaN permutations, fract inputs near 1.0 and exact trigonometric zeros; distinguish f16/f32. Isolate the unresolved legacy multiply denormal/float-mode case.\n3. Reuse an upstream merged fix when available, preserving attribution, and document any remaining differences.\n\n## Done when\n\n- [ ] Exact expected bit patterns and references accompany the cases.\n- [ ] Already merged numerical fixes are validated, not independently duplicated.\n- [ ] Report actual compiler/hardware tests; pure IR tests are labelled as such.\n\n## Dependencies\n\n- Reserve lower.rs functions with LAB-04\n\n## Validation record\n\nInclude commit, toolchain, OS, GPU/driver when relevant, exact commands, exit codes and bounded logs. State checks not run. Never attach game files, derived shaders, memory dumps, credentials or SSH details. Linux gameplay and the performance target remain unverified.\n\nFollow CONTRIBUTING.md and docs/asset-policy.md.\n\n<!-- victory-lab-task:LAB-05 -->\n"
+  },
+  {
+    "id": "LAB-06",
+    "title": "[LAB-06] Validate GPU lifetime fixes and diagnose indirect-execution stalls",
+    "scope": [
+      "crates/victory-gpu/src/host.rs",
+      "crates/victory-gpu/src/descriptor/host.rs",
+      "crates/victory-gpu/src/shadow.rs and queue.rs"
+    ],
+    "problem": "Upstream reports black world frames and device loss; issues #11 and #16 also report hangs during menus. A 30 FPS menu counter does not establish stable rendering.",
+    "steps": [
+      "Review upstream reports and extract a minimal synthetic reproduction when possible.",
+      "Track descriptor reuse, fence completion, resource barriers and lifetimes across submission.",
+      "Collect GPU fault information available under RADV/vkd3d; stop a failing run and preserve its diagnostics."
+    ],
+    "acceptance": [
+      "The specific fault has before/after evidence and a focused regression.",
+      "A bounded run shows correct rendered output and no device loss.",
+      "Do not mask hangs by extending driver timeouts, dropping draws or disabling validation."
+    ],
+    "dependencies": [
+      "Coordinate test seams with LAB-03"
+    ],
+    "body": "Development base: Marvisak/VIctory at 1dd7afd4e68300e5dea41cd33a6e0b297798bb2f.\n\nUpstream commit 8c26061 fixes null-descriptor kinds and resource lifetimes, and reports a bounded world run without device removal. World frames remain black and slow; indirect execution is disabled by default and triggers the title watchdog when enabled. Validate the fixes under vkd3d and isolate the remaining stall.\n\n## Ownership\n\nUnclaimed. Comment to claim this task and name the files/functions you will edit. Submit one focused PR and coordinate shared files before changing them.\n\n## Scope\n\n- crates/victory-gpu/src/host.rs\n- crates/victory-gpu/src/descriptor/host.rs\n- crates/victory-gpu/src/shadow.rs and queue.rs\n\n## Work\n\n1. Review upstream issues #11/#16 and commit 8c26061. Start from its descriptor/lifetime fixes and extract a synthetic regression for any remaining fault.\n2. Track descriptor reuse, fences and resource lifetimes. Separately inspect indirect argument clamping, per-list budgets and the watchdog-triggering submission.\n3. Collect GPU fault information available under RADV/vkd3d; stop a failing run and preserve its diagnostics.\n\n## Done when\n\n- [ ] The specific fault has before/after evidence and a focused regression.\n- [ ] A bounded run shows correct rendered output and no device loss.\n- [ ] Do not mask hangs by extending driver timeouts, dropping draws or disabling validation.\n\n## Dependencies\n\n- Coordinate test seams with LAB-03\n\n## Validation record\n\nInclude commit, toolchain, OS, GPU/driver when relevant, exact commands, exit codes and bounded logs. State checks not run. Never attach game files, derived shaders, memory dumps, credentials or SSH details. Linux gameplay and the performance target remain unverified.\n\nFollow CONTRIBUTING.md and docs/asset-policy.md.\n\n<!-- victory-lab-task:LAB-06 -->\n"
+  },
+  {
+    "id": "LAB-07",
+    "title": "[LAB-07] Validate BCPack decoding and streaming memory use",
+    "scope": [
+      "crates/victory-formats/src/bcpack.rs",
+      "crates/victory-hle/src/modules/dstorage.rs",
+      "crates/victory-pipeline/src/cache.rs"
+    ],
+    "problem": "Streaming and archive decompression are implemented, but correctness and peak memory behavior must be established before optimizing loading on Linux.",
+    "steps": [
+      "Use synthetic fixtures to check truncated inputs, destination bounds and parallel decompression equivalence.",
+      "Measure output hashes, peak memory and throughput with fixed concurrency.",
+      "Keep derived caches outside source and original data; support interrupted cache writes without accepting partial outputs."
+    ],
+    "acceptance": [
+      "Known output bytes match across serial and parallel paths.",
+      "Malformed inputs fail without out-of-bounds writes or unbounded allocation.",
+      "Throughput changes include memory tradeoffs and reproducible commands."
+    ],
+    "dependencies": [
+      "Coordinate any overlapping upstream decoder fixes first"
+    ],
+    "body": "Development base: Marvisak/VIctory at 1dd7afd4e68300e5dea41cd33a6e0b297798bb2f.\n\nStreaming and archive decompression are implemented. The XMA zero-length loop was already fixed by upstream PR #14 (1dd7afd); do not duplicate it. Validate BCPack correctness and peak memory behavior before optimizing Linux loading.\n\n## Ownership\n\nUnclaimed. Comment to claim this task and name the files/functions you will edit. Submit one focused PR and coordinate shared files before changing them.\n\n## Scope\n\n- crates/victory-formats/src/bcpack.rs\n- crates/victory-hle/src/modules/dstorage.rs\n- crates/victory-pipeline/src/cache.rs\n\n## Work\n\n1. Use synthetic fixtures to check truncated inputs, destination bounds and parallel decompression equivalence.\n2. Measure output hashes, peak memory and throughput with fixed concurrency.\n3. Keep derived caches outside source and original data; support interrupted cache writes without accepting partial outputs.\n\n## Done when\n\n- [ ] Known output bytes match across serial and parallel paths.\n- [ ] Malformed inputs fail without out-of-bounds writes or unbounded allocation.\n- [ ] Throughput changes include memory tradeoffs and reproducible commands.\n\n## Dependencies\n\n- Coordinate any overlapping upstream decoder fixes first\n\n## Validation record\n\nInclude commit, toolchain, OS, GPU/driver when relevant, exact commands, exit codes and bounded logs. State checks not run. Never attach game files, derived shaders, memory dumps, credentials or SSH details. Linux gameplay and the performance target remain unverified.\n\nFollow CONTRIBUTING.md and docs/asset-policy.md.\n\n<!-- victory-lab-task:LAB-07 -->\n"
+  },
+  {
+    "id": "LAB-08",
+    "title": "[LAB-08] Build reproducible frame-time and stability measurement tooling",
+    "scope": [
+      "New benchmarks/ or scripts/ measurement tools",
+      "Documentation; no rendering changes"
+    ],
+    "problem": "The lab target is 1080p output, upscaling allowed, no frame generation, 1% low >=30 FPS for three ten-minute routes plus one hour of stability. No gameplay measurements exist.",
+    "steps": [
+      "Capture frame times with run identity, commit, executable hash, GPU/driver, Proton, resolution and scaling settings.",
+      "Define and test 1% low computation from deterministic synthetic timing sequences; retain raw timing samples.",
+      "Describe three route protocols and classify incomplete, hung or device-lost runs as failed/incomplete."
+    ],
+    "acceptance": [
+      "A stable run has raw timing data, route duration and failure counts.",
+      "Menu FPS and loading-screen counters are excluded from gameplay acceptance.",
+      "The report never claims gameplay success from a build, fixture, or missing timing data."
+    ],
+    "dependencies": [
+      "Tooling can start now; gameplay acceptance depends on correct rendering"
+    ],
+    "body": "Development base: Marvisak/VIctory at 1dd7afd4e68300e5dea41cd33a6e0b297798bb2f.\n\nThe lab target is 1080p output, upscaling allowed, no frame generation, 1% low >=30 FPS for three ten-minute routes plus one hour of stability. No gameplay measurements exist.\n\n## Ownership\n\nUnclaimed. Comment to claim this task and name the files/functions you will edit. Submit one focused PR and coordinate shared files before changing them.\n\n## Scope\n\n- New benchmarks/ or scripts/ measurement tools\n- Documentation; no rendering changes\n\n## Work\n\n1. Capture frame times with run identity, commit, executable hash, GPU/driver, Proton, resolution and scaling settings.\n2. Define and test 1% low computation from deterministic synthetic timing sequences; retain raw timing samples.\n3. Describe three route protocols and classify incomplete, hung or device-lost runs as failed/incomplete.\n\n## Done when\n\n- [ ] A stable run has raw timing data, route duration and failure counts.\n- [ ] Menu FPS and loading-screen counters are excluded from gameplay acceptance.\n- [ ] The report never claims gameplay success from a build, fixture, or missing timing data.\n\n## Dependencies\n\n- Tooling can start now; gameplay acceptance depends on correct rendering\n\n## Validation record\n\nInclude commit, toolchain, OS, GPU/driver when relevant, exact commands, exit codes and bounded logs. State checks not run. Never attach game files, derived shaders, memory dumps, credentials or SSH details. Linux gameplay and the performance target remain unverified.\n\nFollow CONTRIBUTING.md and docs/asset-policy.md.\n\n<!-- victory-lab-task:LAB-08 -->\n"
+  }
+]

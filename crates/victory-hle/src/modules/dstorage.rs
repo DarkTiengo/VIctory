@@ -1418,6 +1418,75 @@ mod tests {
     }
 
     #[test]
+    fn parallel_bcpack_requests_match_serial_results() {
+        with_test_tables();
+        let (_dir, file) = file_with(&BC4_STREAM);
+        let cases = [
+            (16, BC4_STREAM.len()),
+            (8, BC4_STREAM.len()),
+            (16, BC4_STREAM.len() / 2),
+        ];
+        let guard = 0xa5;
+        let mut serial = [[guard; 18]; 3];
+        let mut parallel = serial;
+        let requests = |buffers: &mut [[u8; 18]; 3]| {
+            std::array::from_fn::<_, 3, _>(|i| {
+                let (destination_size, source_size) = cases[i];
+                let out = &mut buffers[i][1..][..destination_size];
+                request(
+                    4 << 1,
+                    out.as_mut_ptr().cast(),
+                    out.len(),
+                    file,
+                    0,
+                    source_size,
+                )
+            })
+        };
+        let serial_results = requests(&mut serial).each_ref().map(execute);
+
+        let staging = cases.iter().map(|&(_, size)| size as u64).sum();
+        let mut lanes = lanes(staging);
+        let mut lane = Lane::new(0, 64);
+        lane.unsubmitted
+            .extend(requests(&mut parallel).map(Command::Read));
+        lanes.lanes.insert(0, lane);
+        lanes.submit(0);
+        // Schedule all three together, then run them on separate scoped threads.
+        // The file and each distinct destination stay alive through every join.
+        let jobs: [_; 3] = std::array::from_fn(|_| lanes.start().unwrap());
+        assert_eq!(lanes.staged, staging);
+        let parallel_results = std::thread::scope(|scope| {
+            let workers = jobs.map(|job| {
+                scope.spawn(move || {
+                    let result = execute(&job.request);
+                    (job, result)
+                })
+            });
+            workers.map(|worker| {
+                let (job, result) = worker.join().unwrap();
+                lanes.finish(&job, result);
+                result
+            })
+        });
+        assert_eq!(release(file.cast::<Instance<File>>()), 0);
+
+        assert_eq!(serial_results, [Ok(()), Ok(()), Err(INVALID_DATA)]);
+        assert_eq!(parallel_results, serial_results);
+        assert_eq!(lanes.staged, 0);
+        let expected = bc4_blocks();
+        assert_eq!(serial[0][1..17], expected);
+        assert_eq!(serial[1][1..9], expected[..8]);
+        assert_eq!(parallel[..2], serial[..2]);
+        for ((serial, parallel), (size, _)) in serial.iter().zip(&parallel).zip(cases) {
+            for buffer in [serial, parallel] {
+                assert_eq!(buffer[0], guard);
+                assert!(buffer[size + 1..].iter().all(|&byte| byte == guard));
+            }
+        }
+    }
+
+    #[test]
     fn a_closed_queue_completes_nothing() {
         let (_dir, file) = file_with(&pattern(64));
         let (queue, array) = (new_queue(0), status_array(1));

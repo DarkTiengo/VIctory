@@ -2,7 +2,7 @@
 //! title's own compute passes write most of them; a pass we drop or
 //! translate wrongly leaves whatever the memory held, and a draw of four
 //! billion vertices or a dispatch past the host's limits runs until the
-//! host resets the display driver. So every record is checked on the GPU,
+//! host resets the display driver. So every active record is checked on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
 //!
@@ -29,11 +29,12 @@ const COMPUTE_UAV: (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS) = (
 );
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1), UAV(u2)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; };
 RWByteAddressBuffer args : register(u0);
 // Work reserved by earlier records in the list.
 RWByteAddressBuffer budget : register(u1);
+RWByteAddressBuffer count_buffer : register(u2);
 static const uint BUDGET = 1u << 27;
 
 bool reserve(uint cost) {
@@ -53,6 +54,10 @@ bool reserve(uint cost) {
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
+    [branch]
+    if (counted != 0) {
+        if (id.x >= count_buffer.Load(0)) return;
+    }
     uint at = id.x * stride;
     uint cost;
     if (kind <= 1) {
@@ -221,47 +226,82 @@ fn enhanced_list(list: &HostList) -> Option<ID3D12GraphicsCommandList7> {
     enhanced_barriers().then(|| list.list.cast().ok()).flatten()
 }
 
+// The second dword of the list budget can hold the original count if
+// it shares a word with an argument the clamp may overwrite.
+const COUNT_SNAPSHOT_OFFSET: u64 = 4;
+type Count<'a> = (&'a ID3D12Resource, u64);
+
+pub(crate) struct ValidatedCount<'a> {
+    pub(crate) native: Option<Count<'a>>,
+    restore_at: Option<u64>,
+}
+
 /// Validates the arguments in place and makes the native inputs readable.
-/// Replaces the list's compute root signature and pipeline.
-pub(crate) fn bound(
-    list: &HostList,
+/// Replaces the compute root signature and pipeline. Pass the returned count
+/// to the native call and to `done`, including when pipeline preparation fails.
+pub(crate) fn bound<'a>(
+    list: &'a HostList,
     buffer: &ID3D12Resource,
     offset: u64,
-    count: Option<&ID3D12Resource>,
+    count: Option<Count<'a>>,
     (kind, stride, records): (u32, u32, u32),
-) -> bool {
-    let Some(len) = byte_len(kind, stride, records) else {
-        return false;
-    };
+) -> Result<ValidatedCount<'a>, ()> {
+    let len = byte_len(kind, stride, records).ok_or(())?;
     if len == 0 || !offset.is_multiple_of(4) {
-        return false;
+        return Err(());
     }
     // SAFETY: buffer is a live host resource.
     let (width, gpu) = unsafe { (buffer.GetDesc().Width, buffer.GetGPUVirtualAddress()) };
     if offset.checked_add(len).is_none_or(|end| end > width) {
-        return false;
+        return Err(());
     }
-    let Some(gpu) = gpu.checked_add(offset) else {
-        return false;
-    };
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
-        return false;
-    };
+    let gpu = gpu.checked_add(offset).ok_or(())?;
+    let count_address = count
+        .map(|(counter, at)| {
+            // SAFETY: counter is a live host buffer.
+            let (width, base) = unsafe { (counter.GetDesc().Width, counter.GetGPUVirtualAddress()) };
+            if !at.is_multiple_of(4) || at.checked_add(4).is_none_or(|end| end > width) {
+                return Err(());
+            }
+            base.checked_add(at).ok_or(())
+        })
+        .transpose()?;
+    let c = clamp().ok_or(())?;
+    let budget = list.budget().ok_or(())?;
+    // SAFETY: the list retains its live budget buffer.
+    let budget_address = unsafe { budget.GetGPUVirtualAddress() };
     let l = &list.list;
     let enhanced = enhanced_list(list);
-    let separate_count = count.filter(|&count| count != buffer);
-    let written = [buffer, budget];
-    if let Some(enhanced) = &enhanced {
-        list.use_indirect_buffers(
-            [Some(buffer), separate_count, Some(budget)]
-                .into_iter()
-                .flatten(),
-        );
-        buffer_barriers(enhanced, written, COMMON_ACCESS, COMPUTE_UAV);
+    let separate_count = count
+        .map(|(counter, _)| counter)
+        .filter(|&counter| counter != buffer);
+    let buffers = || [buffer, budget].into_iter().chain(separate_count);
+    if enhanced.is_some() {
+        list.use_indirect_buffers(buffers());
     } else {
         uav_barrier(l);
     }
-    let constants = [kind, stride, records, 0];
+    let writable_bytes = if kind <= 1 { 8 } else { 12 };
+    let (native, count_address, restore_at) = if let Some((counter, at)) = count
+        && counter == buffer
+        && (offset..offset + len).contains(&at)
+        && (at - offset) % u64::from(stride) < writable_bytes
+    {
+        // Both consumers need the same count even if the clamp writes it.
+        let snapshot = (budget, COUNT_SNAPSHOT_OFFSET);
+        copy_count(l, enhanced.as_ref(), (buffer, at), snapshot, false);
+        (
+            Some(snapshot),
+            Some(budget_address + COUNT_SNAPSHOT_OFFSET),
+            Some(at),
+        )
+    } else {
+        if let Some(enhanced) = &enhanced {
+            buffer_barriers(enhanced, buffers(), COMMON_ACCESS, COMPUTE_UAV);
+        }
+        (count, count_address, None)
+    };
+    let constants = [kind, stride, records, u32::from(count_address.is_some())];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -269,48 +309,97 @@ pub(crate) fn bound(
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
-        l.SetComputeRootUnorderedAccessView(2, budget.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(2, budget_address);
+        l.SetComputeRootUnorderedAccessView(3, count_address.unwrap_or(budget_address));
         l.Dispatch(records.div_ceil(THREADS_PER_GROUP), 1, 1);
     }
     if let Some(enhanced) = &enhanced {
-        buffer_barriers(enhanced, written, COMPUTE_UAV, COMMON_ACCESS);
-        buffer_barriers(enhanced, separate_count, COMMON_ACCESS, COMMON_ACCESS);
+        buffer_barriers(enhanced, buffers(), COMPUTE_UAV, COMMON_ACCESS);
     } else {
         uav_barrier(l);
         // Older hosts use the existing COMMON promotion/UAV convention
-        // for shadow buffers. The sanitizer leaves arguments in UAV.
-        for buffer in [Some(buffer), separate_count].into_iter().flatten() {
-            // SAFETY: an open list and live buffer.
-            unsafe {
-                l.ResourceBarrier(&[transition(
-                    buffer,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                )]);
-            }
-        }
+        // for shadow buffers. The clamp uses both native inputs as UAVs.
+        transition_indirect(l, buffer, native, UAV_STATE, INDIRECT_STATE);
     }
-    true
+    Ok(ValidatedCount { native, restore_at })
 }
 
-/// Finish indirect reads before later passes reuse the buffers. COMMON
-/// access leaves them available to shaders, vertex fetch, or another call.
-pub(crate) fn done(list: &HostList, args: &ID3D12Resource, count: Option<&ID3D12Resource>) {
-    let buffers = [Some(args), count.filter(|&count| count != args)]
-        .into_iter()
-        .flatten();
-    if let Some(enhanced) = enhanced_list(list) {
-        buffer_barriers(&enhanced, buffers, COMMON_ACCESS, COMMON_ACCESS);
+/// Finish indirect reads before later passes reuse the buffers. Restore the
+/// original count if it shared a word the clamp could have overwritten.
+pub(crate) fn done(list: &HostList, args: &ID3D12Resource, count: ValidatedCount<'_>) {
+    let enhanced = enhanced_list(list);
+    if let (Some(at), Some(snapshot)) = (count.restore_at, count.native) {
+        copy_count(&list.list, enhanced.as_ref(), snapshot, (args, at), true);
+    } else if let Some(enhanced) = &enhanced {
+        let counter = count
+            .native
+            .map(|(counter, _)| counter)
+            .filter(|&counter| counter != args);
+        buffer_barriers(
+            enhanced,
+            [args].into_iter().chain(counter),
+            COMMON_ACCESS,
+            COMMON_ACCESS,
+        );
     } else {
-        for buffer in buffers {
-            // SAFETY: bound transitioned these buffers before indirect use.
-            unsafe {
-                list.list.ResourceBarrier(&[transition(
-                    buffer,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
-            }
+        transition_indirect(&list.list, args, count.native, INDIRECT_STATE, UAV_STATE);
+    }
+}
+
+const UAV_STATE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+const INDIRECT_STATE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+
+fn transition_indirect(
+    list: &ID3D12GraphicsCommandList,
+    args: &ID3D12Resource,
+    count: Option<Count<'_>>,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) {
+    let counter = count.map(|(counter, _)| counter).filter(|&counter| counter != args);
+    for buffer in [args].into_iter().chain(counter) {
+        // SAFETY: an open list and a live buffer in the caller's tracked state.
+        unsafe { list.ResourceBarrier(&[transition(buffer, before, after)]) };
+    }
+}
+
+fn copy_count(
+    list: &ID3D12GraphicsCommandList,
+    enhanced: Option<&ID3D12GraphicsCommandList7>,
+    (source, source_offset): Count<'_>,
+    (destination, destination_offset): Count<'_>,
+    restore: bool,
+) {
+    let src = (D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_ACCESS_COPY_SOURCE);
+    let dst = (D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_ACCESS_COPY_DEST);
+    if let Some(enhanced) = enhanced {
+        buffer_barriers(enhanced, [source], COMMON_ACCESS, src);
+        buffer_barriers(enhanced, [destination], COMMON_ACCESS, dst);
+    } else {
+        let before = if restore { INDIRECT_STATE } else { UAV_STATE };
+        // SAFETY: both buffers are live, in UAV/COMMON before the clamp or
+        // INDIRECT_ARGUMENT after it.
+        unsafe {
+            list.ResourceBarrier(&[
+                transition(source, before, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(destination, before, D3D12_RESOURCE_STATE_COPY_DEST),
+            ]);
+        }
+    }
+    // SAFETY: different live buffers, aligned in-range dwords, and the
+    // copy access synchronized by the preceding barriers.
+    unsafe { list.CopyBufferRegion(destination, destination_offset, source, source_offset, 4) };
+    if let Some(enhanced) = enhanced {
+        let after = if restore { COMMON_ACCESS } else { COMPUTE_UAV };
+        buffer_barriers(enhanced, [source], src, after);
+        buffer_barriers(enhanced, [destination], dst, after);
+    } else {
+        // SAFETY: the copy leaves both buffers in their respective copy states.
+        unsafe {
+            list.ResourceBarrier(&[
+                transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, UAV_STATE),
+                transition(destination, D3D12_RESOURCE_STATE_COPY_DEST, UAV_STATE),
+            ]);
         }
     }
 }
@@ -468,14 +557,15 @@ mod tests {
 
         fn record(host: &Host, list: &HostList, kind: u32, input: &[[u32; N]]) -> Self {
             let args = Self::new(host, input);
-            assert!(bound(
+            let count = bound(
                 list,
                 &args.buffer,
                 Self::OFFSET,
                 None,
                 (kind, (4 * N) as u32, input.len() as u32)
-            ));
-            done(list, &args.buffer, None);
+            )
+            .unwrap();
+            done(list, &args.buffer, count);
             args
         }
 
@@ -489,20 +579,24 @@ mod tests {
     }
 
     fn used(list: &HostList) -> u32 {
+        budget_word(list, 0)
+    }
+
+    fn budget_word(list: &HostList, offset: usize) -> u32 {
         let buffer = list.budget().unwrap();
         let mut mapped = std::ptr::null_mut();
-        // SAFETY: the submission has finished and the buffer holds a u32.
+        // SAFETY: the submission has finished and offset names a reserved dword.
         unsafe {
             buffer
                 .Map(
                     0,
-                    Some(&D3D12_RANGE { Begin: 0, End: 4 }),
+                    Some(&D3D12_RANGE { Begin: offset, End: offset + 4 }),
                     Some(&mut mapped),
                 )
                 .unwrap();
-            let used = mapped.cast::<u32>().read();
+            let word = mapped.cast::<u8>().add(offset).cast::<u32>().read();
             buffer.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
-            used
+            word
         }
     }
 
@@ -623,6 +717,77 @@ mod tests {
         assert_eq!(used(&list), 6 + (1 << 26) + 12 + (17 + 65535) * 128);
     }
 
+    #[test]
+    fn counted_validation_preserves_inactive_arguments() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let input = [[1, 1, 1], [1025, 1024, 1]];
+        let args = Arguments::new(host, &input);
+        let count = Arguments::new(host, &[[1]]);
+        let native = bound(&list, &args.buffer, 4, Some((&count.buffer, 4)), (COMPUTE, 12, 2)).unwrap();
+        done(&list, &args.buffer, native);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(args.read(), input, "inactive argument was modified");
+        assert_eq!(used(&list), 64);
+    }
+
+    #[test]
+    fn validation_respects_count_and_maximum() {
+        let Some(host) = host() else { return };
+        let input = [[1, 1, 1], [2, 1, 1], [1025, 1024, 1], [9, 1, 1]];
+        let bounded = [[1, 1, 1], [2, 1, 1], EMPTY_DISPATCH, [9, 1, 1]];
+        for (count, expected, cost) in [
+            (Some(0), input, 0),
+            (Some(1), input, 64),
+            (Some(4), bounded, 3 * 64),
+            (None, bounded, 3 * 64),
+        ] {
+            let list = host.new_list().unwrap();
+            let args = Arguments::new(host, &input);
+            let counter = count.map(|value| Arguments::new(host, &[[value]]));
+            let counter = counter.as_ref().map(|counter| (&counter.buffer, 4));
+            let native = bound(&list, &args.buffer, 4, counter, (COMPUTE, 12, 3)).unwrap();
+            assert!(native.native == counter, "count={count:?}");
+            done(&list, &args.buffer, native);
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(args.read(), expected, "count={count:?}");
+            assert_eq!(used(&list), cost, "count={count:?}");
+        }
+    }
+
+    #[test]
+    fn validation_preserves_a_count_overlapping_an_argument() {
+        let Some(host) = host() else { return };
+        let args = Arguments::new(host, &[[2, 65536, 1], [1, 1, 1], [9, 1, 1]]);
+        let work = Arguments::new(host, &[[6, 2, 3]]);
+        let execution_budget = Arguments::new(host, &[[0]]);
+        let signature = dispatch_signature(host, 12);
+        let list = host.new_list().unwrap();
+        let native = bound(
+            &list,
+            &args.buffer,
+            4,
+            Some((&args.buffer, 4)),
+            (COMPUTE, 12, 3),
+        )
+        .unwrap();
+        assert!(native.native == Some((list.budget().unwrap(), COUNT_SNAPSHOT_OFFSET)));
+        // SAFETY: use a separate live UAV for the workload budget. The
+        // list's budget buffer is the indirect counter for this call.
+        unsafe { list.list.SetComputeRootUnorderedAccessView(2, execution_budget.gpu()) };
+        dispatch(&list, (&args.buffer, 4), &signature, 3, native, work.gpu());
+        list.close();
+        for submissions in 1..=2 {
+            host.execute(&[&list]);
+            assert_eq!(args.read(), [[2, 0, 0], [1, 1, 1], [9, 1, 1]], "counter changed");
+            assert_eq!(budget_word(&list, COUNT_SNAPSHOT_OFFSET as usize), 2);
+            assert_eq!(used(&list), 64);
+            assert_eq!(execution_budget.read(), [[submissions * 36 * 64]]);
+        }
+    }
+
     fn dispatch_signature(host: &Host, stride: u32) -> ID3D12CommandSignature {
         let mut signature: Option<ID3D12CommandSignature> = None;
         let argument = D3D12_INDIRECT_ARGUMENT_DESC {
@@ -652,28 +817,29 @@ mod tests {
         args: (&ID3D12Resource, u64),
         signature: &ID3D12CommandSignature,
         max: u32,
-        count: Option<(&ID3D12Resource, u64)>,
+        count: ValidatedCount<'_>,
         work: u64,
     ) {
         // Reuse the sanitizer as the executed workload. Each dispatch
         // increments the budget by a known amount.
         let constants = [COMPUTE, 12, 1, 0];
         // SAFETY: inputs are synchronized and live, and the sanitizer
-        // pipeline is still bound with the list's budget UAV.
+        // pipeline is still bound with a live budget UAV.
         unsafe {
             list.list
                 .SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
             list.list.SetComputeRootUnorderedAccessView(1, work);
+            list.list.SetComputeRootUnorderedAccessView(3, work);
             list.list.ExecuteIndirect(
                 signature,
                 max,
                 args.0,
                 args.1,
-                count.map(|(buffer, _)| buffer),
-                count.map_or(0, |(_, offset)| offset),
+                count.native.map(|(buffer, _)| buffer),
+                count.native.map_or(0, |(_, offset)| offset),
             );
         }
-        done(list, args.0, count.map(|(buffer, _)| buffer));
+        done(list, args.0, count);
     }
 
     #[test]
@@ -686,9 +852,9 @@ mod tests {
         let work = Arguments::new(host, &[[6, 2, 3]]);
         let signature = dispatch_signature(host, 16);
         let (short, _) = host.shared_buffer(31).unwrap();
-        assert!(!bound(&list, &short, 4, None, (COMPUTE, 16, 2)));
-        assert!(bound(&list, &args.buffer, 4, None, (COMPUTE, 16, 2)));
-        dispatch(&list, (&args.buffer, 20), &signature, 1, None, work.gpu());
+        assert!(bound(&list, &short, 4, None, (COMPUTE, 16, 2)).is_err());
+        let native = bound(&list, &args.buffer, 4, None, (COMPUTE, 16, 2)).unwrap();
+        dispatch(&list, (&args.buffer, 20), &signature, 1, native, work.gpu());
         list.close();
         host.execute(&[&list]);
         assert_eq!(used(&list), (2 + 36) * 64);
@@ -699,31 +865,34 @@ mod tests {
     fn cpu_count_is_reused_with_separate_and_shared_buffers() {
         let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
-        let args = Arguments::new(host, &[[1, 1, 1, 1, 1, 1, 1]]);
+        let args = Arguments::new(host, &[[1, 1, 1, 1, 1, 1, 1, 1]]);
         let count = Arguments::new(host, &[[1]]);
         let work = Arguments::new(host, &[[6, 2, 3]]);
-        let signature = dispatch_signature(host, 12);
-        for (buffer, offset) in [(&count.buffer, 4), (&args.buffer, 28)] {
-            assert!(bound(
+        let signature = dispatch_signature(host, 16);
+        // Separate allocation, padding between arguments, and after the last argument.
+        for (buffer, offset) in [(&count.buffer, 4), (&args.buffer, 16), (&args.buffer, 32)] {
+            let native = bound(
                 &list,
                 &args.buffer,
                 4,
-                Some(buffer),
-                (COMPUTE, 12, 2)
-            ));
+                Some((buffer, offset)),
+                (COMPUTE, 16, 2),
+            )
+            .unwrap();
+            assert!(native.native == Some((buffer, offset)));
             dispatch(
                 &list,
                 (&args.buffer, 4),
                 &signature,
                 2,
-                Some((buffer, offset)),
+                native,
                 work.gpu(),
             );
         }
         list.close();
         for _ in 0..2 {
             host.execute(&[&list]);
-            assert_eq!(used(&list), 2 * (2 + 36) * 64);
+            assert_eq!(used(&list), 3 * (1 + 36) * 64);
         }
     }
 
@@ -753,30 +922,34 @@ mod tests {
             writer
                 .list
                 .SetComputeRootUnorderedAccessView(2, writer_budget.GetGPUVirtualAddress());
+            writer
+                .list
+                .SetComputeRootUnorderedAccessView(3, writer_budget.GetGPUVirtualAddress());
             writer.list.Dispatch(1, 1, 1);
         }
-        assert!(bound(
+        let native = bound(
             &reader,
             &args.buffer,
             4,
-            Some(&count.buffer),
+            Some((&count.buffer, 8)),
             (COMPUTE, 12, 2)
-        ));
+        )
+        .unwrap();
         dispatch(
             &reader,
             (&args.buffer, 4),
             &signature,
             2,
-            Some((&count.buffer, 8)),
+            native,
             work.gpu(),
         );
         writer.close();
         reader.close();
         host.execute(&[&writer, &reader]);
         assert_eq!(count.read(), [[0, 1, 1]]);
-        assert_eq!(used(&reader), (2 + 36) * 64);
+        assert_eq!(used(&reader), (1 + 36) * 64);
         host.execute(&[&reader]);
-        assert_eq!(used(&reader), (2 + 36) * 64);
+        assert_eq!(used(&reader), (1 + 36) * 64);
     }
 
     #[test]
@@ -802,19 +975,20 @@ mod tests {
             list.list
                 .CopyBufferRegion(&count.buffer, 4, &input.buffer, 4, 4);
         }
-        assert!(bound(
+        let native = bound(
             &list,
             &args.buffer,
             4,
-            Some(&count.buffer),
+            Some((&count.buffer, 4)),
             (COMPUTE, 12, 2)
-        ));
+        )
+        .unwrap();
         dispatch(
             &list,
             (&args.buffer, 4),
             &signature,
             2,
-            Some((&count.buffer, 4)),
+            native,
             work.gpu(),
         );
         // SAFETY: the indirect read has finished and the count buffer is
@@ -825,7 +999,7 @@ mod tests {
         };
         list.close();
         host.execute(&[&list]);
-        assert_eq!(used(&list), (2 + 36) * 64);
+        assert_eq!(used(&list), (1 + 36) * 64);
         assert_eq!(first_arg.read(), [[1]]);
         assert_eq!(result.read(), [[1]]);
     }

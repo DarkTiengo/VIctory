@@ -968,18 +968,19 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        let count_buffer = counter.as_ref().map(|(s, _)| &s.buffer);
+        let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(
+        let Ok(count) = crate::indirect::bound(
             list,
             &args.buffer,
             args.offset(arguments),
-            count_buffer,
+            count,
             (kind, stride, max),
-        ) {
-            why("not bounded (no clamp or invalid argument range)");
+        ) else {
+            why("not bounded (no clamp or invalid argument/count range)");
             return false;
-        }
+        };
+        let count_buffer = count.native.map(|(buffer, _)| buffer);
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
@@ -995,7 +996,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer, count_buffer);
+            crate::indirect::done(list, &args.buffer, count);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1016,10 +1017,10 @@ impl State {
                 &args.buffer,
                 args.offset(arguments),
                 count_buffer,
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                count.native.map_or(0, |(_, offset)| offset),
             )
         };
-        crate::indirect::done(list, &args.buffer, count_buffer);
+        crate::indirect::done(list, &args.buffer, count);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

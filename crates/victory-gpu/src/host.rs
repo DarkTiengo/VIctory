@@ -34,6 +34,7 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
+type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -41,6 +42,7 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    indirect_prelude: OnceLock<windows::core::Result<Prelude>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -214,6 +216,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            indirect_prelude: OnceLock::new(),
             event,
             rtvs,
             rtv_size,
@@ -244,17 +247,25 @@ pub(crate) struct HostList {
     /// resource first.
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    prelude: Prelude,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
-    /// The work its indirect executions may still do (`indirect`): a
+    /// The work its indirect executions have reserved (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
+    /// and at the end, and where they are read back.
+    #[cfg(feature = "diagnostics")]
+    stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
+
+/// Timestamps per list (diagnostics); commands past them are not timed.
+#[cfg(feature = "diagnostics")]
+const STAMPS: u32 = 4096;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -272,6 +283,15 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| {
         cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
+}
+
+/// Whether each list of a submission runs and is timed on its own, slow
+/// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
+/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+#[cfg(feature = "diagnostics")]
+fn timing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -330,6 +350,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Whole buffers whose indirect uses need enhanced barriers.
+    indirect_buffers: std::collections::HashMap<usize, ID3D12Resource>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -338,8 +360,6 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
-    /// Whether a step zeroes the indirect-work budget.
-    budget_zeroed: bool,
 }
 
 impl Host {
@@ -391,63 +411,167 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
             Ok(HostList {
                 allocator,
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
-                prelude: (prelude_allocator, prelude),
+                prelude: self.new_prelude()?,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
+                stamps: OnceLock::new(),
             })
         }
     }
 
+    fn new_prelude(&self) -> windows::core::Result<Prelude> {
+        // SAFETY: a direct allocator and a list created against it.
+        unsafe {
+            let allocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )?;
+            list.Close()?;
+            Ok((allocator, list))
+        }
+    }
+
+    /// Selects enhanced barriers for all indirect buffers before any list
+    /// in this submission can implicitly promote them to a legacy state.
+    /// The submission lock prevents reuse while a prior prelude is running.
+    fn indirect_prelude(
+        &self,
+        runs: &[&HostList],
+    ) -> windows::core::Result<Option<ID3D12CommandList>> {
+        let mut buffers = std::collections::HashMap::new();
+        for list in runs {
+            buffers.extend(
+                list.deferred()
+                    .indirect_buffers
+                    .iter()
+                    .map(|(&key, buffer)| (key, buffer.clone())),
+            );
+            if let Some(Some((_, data))) = list.budget.get() {
+                // SAFETY: this list's budget is mapped, and under the
+                // submission lock the GPU finished any prior use.
+                unsafe { (*data as *mut u32).write_volatile(0) };
+            }
+        }
+        if buffers.is_empty() {
+            return Ok(None);
+        }
+        let (allocator, list) = self
+            .indirect_prelude
+            .get_or_init(|| self.new_prelude())
+            .as_ref()
+            .map_err(Clone::clone)?;
+        // SAFETY: the preceding submission finished, and buffers live
+        // through this submission. A new submission starts them in COMMON.
+        unsafe {
+            allocator.Reset()?;
+            list.Reset(allocator, None)?;
+            crate::indirect::buffer_barriers(
+                &list.cast::<ID3D12GraphicsCommandList7>()?,
+                buffers.values(),
+                (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS),
+                (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON),
+            );
+            list.Close()?;
+        }
+        list.cast().map(Some)
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // One submission at a time from preparation to copy-back: snapshots
+        // and the ranges shaders write are per host copy, not per submission.
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        // Where each run's lists start in `lists`.
+        let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
+            firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        *submitted += 1;
         let prepared = std::time::Instant::now();
-        // SAFETY: closed lists; the fence and event are ours.
-        unsafe {
-            self.queue.ExecuteCommandLists(&lists);
-            let waited = self
-                .queue
-                .Signal(&self.fence, *submitted)
-                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-            match waited {
-                Ok(()) => {
-                    WaitForSingleObject(self.event, INFINITE);
+        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        #[cfg(feature = "diagnostics")]
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+            firsts
+                .iter()
+                .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                .map(|(&a, &b)| &lists[a..b])
+                .collect()
+        } else {
+            vec![&lists[..]]
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let groups = [&lists[..]];
+        for (i, group) in groups.iter().enumerate() {
+            // Buffer state decays at each ExecuteCommandLists boundary.
+            // In timing mode each list is a separate submission.
+            let submitted_runs = if groups.len() > 1 {
+                &runs[i..i + 1]
+            } else {
+                runs
+            };
+            let mut prefixed = Vec::new();
+            let group = match self.indirect_prelude(submitted_runs) {
+                Ok(Some(prelude)) => {
+                    prefixed.push(Some(prelude));
+                    prefixed.extend_from_slice(group);
+                    prefixed.as_slice()
                 }
-                Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                Ok(None) => group,
+                Err(e) => fail(format_args!("indirect buffer prelude did not record ({e})")),
+            };
+            *submitted += 1;
+            let started = std::time::Instant::now();
+            // SAFETY: closed lists; the fence and event are ours.
+            unsafe {
+                self.queue.ExecuteCommandLists(group);
+                let waited = self
+                    .queue
+                    .Signal(&self.fence, *submitted)
+                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                match waited {
+                    Ok(()) => {
+                        WaitForSingleObject(self.event, INFINITE);
+                    }
+                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                }
             }
+            #[cfg(feature = "diagnostics")]
+            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                for (ms, op) in runs[i].slowest(frequency, 6) {
+                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                }
+            }
+            let _ = (i, started);
         }
+        let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -677,7 +801,92 @@ impl Host {
 }
 
 impl HostList {
+    /// The timestamp heap and its read-back buffer (diagnostics, timing on).
+    #[cfg(feature = "diagnostics")]
+    fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
+        if !timing() {
+            return None;
+        }
+        self.stamps
+            .get_or_init(|| {
+                let device = &host()?.device;
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                let mut back: Option<ID3D12Resource> = None;
+                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: u64::from(STAMPS) * 8,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                // SAFETY: plain object creation.
+                unsafe {
+                    device
+                        .CreateQueryHeap(
+                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
+                            &mut heap,
+                        )
+                        .ok()?;
+                    device
+                        .CreateCommittedResource(
+                            &readback,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            None,
+                            &mut back,
+                        )
+                        .ok()?;
+                }
+                Some((heap?, back?))
+            })
+            .as_ref()
+    }
+
+    /// The noted commands that took longest on the GPU, longest first, as
+    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    #[cfg(feature = "diagnostics")]
+    fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+            return Vec::new();
+        };
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        // SAFETY: a read-back buffer the finished list resolved into.
+        let stamps: Vec<u64> = unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return Vec::new();
+            }
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
+            back.Unmap(0, None);
+            s
+        };
+        let mut times: Vec<(f64, String)> = (0..count)
+            .map(|i| {
+                let ticks = stamps[i + 1].saturating_sub(stamps[i]);
+                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+            })
+            .collect();
+        times.sort_by(|a, b| b.0.total_cmp(&a.0));
+        times.truncate(n);
+        times
+    }
+
     pub(crate) fn close(&self) {
+        #[cfg(feature = "diagnostics")]
+        if let Some((heap, back)) = self.stamps() {
+            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+            // SAFETY: an open list, our heap and read-back buffer.
+            unsafe {
+                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+            }
+        }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -790,6 +999,11 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if dred_on() {
+            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
+                // SAFETY: an open list and our query heap.
+                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+            }
             let what = what();
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
@@ -911,27 +1125,28 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
+    /// The list's indirect-work budget, zeroed before each submission.
+    pub(crate) fn budget(&self) -> Option<&ID3D12Resource> {
+        self.budget
             .get_or_init(|| {
                 let (b, d) = host()?.shared_buffer(256)?;
                 Some((b, d as usize))
             })
-            .as_ref()?;
+            .as_ref()
+            .map(|(buffer, _)| buffer)
+    }
+
+    pub(crate) fn use_indirect_buffers<'a>(
+        &self,
+        buffers: impl IntoIterator<Item = &'a ID3D12Resource>,
+    ) {
         let mut deferred = self.deferred();
-        if !deferred.budget_zeroed {
-            deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
+        for buffer in buffers {
             deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+                .indirect_buffers
+                .entry(buffer.as_raw() as usize)
+                .or_insert_with(|| buffer.clone());
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -1280,16 +1495,29 @@ impl Meter {
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        // Over the same frames as the counts above.
+        #[cfg(feature = "diagnostics")]
+        let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline and {indirect:.0} indirect"
+                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
+                 {indirect:.0} indirect",
+                making = crate::pipeline::making()
             );
             #[cfg(feature = "diagnostics")]
-            crate::copystat::log(frames);
+            {
+                crate::copystat::log(frames);
+                for (why, n) in drops.iter().take(40) {
+                    tracing::info!(
+                        "dropped {:.1}/frame without a host pipeline: {why}",
+                        *n as f64 / frames
+                    );
+                }
+            }
         }
         if self.caption.is_none() {
             // The window's own text, read without a message.

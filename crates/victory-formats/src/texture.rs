@@ -249,6 +249,13 @@ fn spread(bits: &[u32]) -> Vec<u32> {
 
 const MAX_MIPS: u32 = 16;
 
+/// The largest width, height and depth (or array size) accepted, in texels.
+/// GFX10's image descriptors hold at most 16384 texels per side, so no
+/// texture the GPU can use is refused. The bound also keeps every size
+/// computed below within `u64` (and its `u32` steps), which unchecked
+/// values from a title would otherwise overflow.
+const MAX_EXTENT: u32 = 1 << 14;
+
 /// 256-byte micro tile dimensions by log2 element size, 2D and 3D.
 const BLOCK_256_2D: [[u32; 2]; 5] = [[16, 16], [16, 8], [8, 8], [8, 4], [4, 4]];
 const BLOCK_256_3D: [[u32; 3]; 5] = [[8, 4, 8], [4, 4, 8], [4, 4, 4], [4, 2, 4], [2, 2, 4]];
@@ -258,9 +265,9 @@ impl Layout {
     pub fn new(desc: &Desc) -> Result<Layout, Error> {
         let d = *desc;
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
-        let valid = d.width > 0
-            && d.height > 0
-            && d.depth > 0
+        let valid = (1..=MAX_EXTENT).contains(&d.width)
+            && (1..=MAX_EXTENT).contains(&d.height)
+            && (1..=MAX_EXTENT).contains(&d.depth)
             && (1..=MAX_MIPS).contains(&d.mips)
             && d.element_bytes.is_power_of_two()
             && d.element_bytes <= 16
@@ -644,7 +651,12 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
-        let need = (depth as usize - 1) * depth_pitch + (m.height as usize - 1) * row_pitch + bytes;
+        let need = (depth as usize - 1)
+            .checked_mul(depth_pitch)
+            .zip((m.height as usize - 1).checked_mul(row_pitch))
+            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
         if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
@@ -838,6 +850,27 @@ mod tests {
         }
     }
 
+    /// Sizes past the hardware's 16384 texels per side are refused instead
+    /// of overflowing the size arithmetic (found by random-input testing).
+    #[test]
+    fn extents_past_the_hardware_limit_are_invalid() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_D_X] {
+            let largest = Layout::new(&desc(MAX_EXTENT, MAX_EXTENT, 15, 16, swizzle)).unwrap();
+            assert!(largest.size >= u64::from(MAX_EXTENT) * u64::from(MAX_EXTENT) * 16);
+            for (w, h) in [
+                (MAX_EXTENT + 1, 1),
+                (1, MAX_EXTENT + 1),
+                (u32::MAX, u32::MAX),
+            ] {
+                let result = Layout::new(&desc(w, h, 1, 16, swizzle));
+                assert_eq!(result, Err(Error::Invalid), "{w}x{h}");
+            }
+            let mut deep = desc(1, 1, 1, 16, swizzle);
+            deep.depth = u32::MAX;
+            assert_eq!(Layout::new(&deep), Err(Error::Invalid));
+        }
+    }
+
     #[test]
     fn blocks_hold_their_size_in_elements() {
         for log2 in [8u32, 12, 16] {
@@ -980,6 +1013,37 @@ mod tests {
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
         assert!(!t.planes[0].layout.addressable());
+    }
+
+    #[test]
+    fn texture_copies_reject_overflowing_pitches() {
+        let layout = Layout::new(&desc(4, 2, 1, 4, Swizzle::LINEAR)).unwrap();
+        let mut tiled = vec![0; layout.size as usize];
+        let mut linear = [0; 32];
+        assert_eq!(
+            layout.detile(&tiled, 0, 0, &mut linear, usize::MAX, 0),
+            Err(Error::TooSmall)
+        );
+        assert_eq!(
+            layout.tile(&mut tiled, 0, 0, &linear, usize::MAX, 0),
+            Err(Error::TooSmall)
+        );
+    }
+
+    #[test]
+    fn volume_copy_rejects_overflowing_depth_pitch() {
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 3,
+            ..desc(4, 2, 1, 4, Swizzle::LINEAR)
+        })
+        .unwrap();
+        let tiled = vec![0; layout.size as usize];
+        let mut linear = [0; 96];
+        assert_eq!(
+            layout.detile(&tiled, 0, 0, &mut linear, 16, usize::MAX),
+            Err(Error::TooSmall)
+        );
     }
 
     #[test]

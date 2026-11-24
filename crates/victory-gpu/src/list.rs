@@ -1129,14 +1129,14 @@ extern "system" fn draw(_: This) {
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
-/// offset)`. Grand Theft Auto VI's signatures (2026-11-23) hold one
-/// argument each: draw (stride 16), indexed draw (20), dispatch (12), mesh
-/// dispatch (12), and a console type 105 (stride 12, fields 0, 60000, 0,
-/// over its 174 MB buffer) whose meaning is unknown. Those of PC types run
+/// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
+/// hold one argument each: draw (stride 16), indexed draw (20), dispatch
+/// (12), mesh dispatch (12), and the console's single-pass dispatch, type
+/// 105 (stride 12: the three group counts; its flags live in the
+/// signature, the title passes none), run as a plain dispatch. They run
 /// through the host's indirect execution (`State::execute_indirect`).
-/// shortcut: type 105 and signatures that change root arguments are
-/// dropped (logged once per signature); decode 105 when its draws are
-/// missed.
+/// shortcut: signatures that change root arguments are dropped (logged
+/// once per signature).
 extern "system" fn execute_indirect(
     this: This,
     signature: This,
@@ -1150,25 +1150,41 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
-    let mut ran = false;
-    // shortcut: off unless `VICTORY_INDIRECT` is set (diagnostics builds):
-    // with it the world presented no frame for 30 s and the title's own
-    // GPU watchdog ended it (2026-11-24, cause not found); without it the
-    // world runs, with most geometry missing.
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_INDIRECT").is_some()
-    });
+    let arguments = crate::resource::buffer_bytes(arguments);
     #[cfg(windows)]
-    if on
-        && let ([[kind, ..]], Some(address)) = (args, address)
+    let indirect = match args {
+        [[kind, ..]] => {
+            const DISPATCH: u32 = 2;
+            const DISPATCH_SINGLE: u32 = 105;
+            let kind = if *kind == DISPATCH_SINGLE {
+                DISPATCH
+            } else {
+                *kind
+            };
+            indirect_arguments(arguments, offset, (kind, stride, max)).map(|at| (kind, at))
+        }
+        _ => None,
+    };
+    #[cfg(windows)]
+    let address = indirect.map(|(_, at)| at);
+    #[cfg(not(windows))]
+    let address = indirect_address(arguments, offset, u64::from(stride) * u64::from(max));
+    let counter = indirect_address(crate::resource::buffer_bytes(count), count_offset, 4);
+    let mut ran = false;
+    #[cfg(windows)]
+    if let Some((kind, address)) = indirect
         && (count.is_null() || counter.is_some())
     {
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (*kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
+    } else {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::pipeline::note_why(format!(
+            "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
+            address.is_some(),
+            count.is_null() || counter.is_some()
+        ));
     }
     if ran {
         return;
@@ -1187,6 +1203,29 @@ extern "system" fn execute_indirect(
             "indirect execution dropped (first time for this signature)"
         );
     }
+}
+
+#[cfg(windows)]
+fn indirect_arguments(
+    buffer: Option<(*mut u8, u64)>,
+    offset: u64,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<u64> {
+    indirect_address(
+        buffer,
+        offset,
+        crate::indirect::byte_len(kind, stride, records)?,
+    )
+}
+
+/// Check against the title buffer before resolving its host copy, which
+/// may include other memory or padding beyond the title's buffer.
+fn indirect_address(buffer: Option<(*mut u8, u64)>, offset: u64, len: u64) -> Option<u64> {
+    let (base, size) = buffer?;
+    if !offset.is_multiple_of(4) || offset.checked_add(len)? > size {
+        return None;
+    }
+    (base as u64).checked_add(offset)
 }
 
 /// Indirect executions dropped since the last call.
@@ -1391,6 +1430,37 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn indirect_arguments_fit_the_title_buffer_without_trailing_padding() {
+        let mut data = [0u8; 32];
+        let base = data.as_mut_ptr();
+        let records = (2, 16, 2);
+        assert_eq!(
+            indirect_arguments(Some((base, 28)), 0, records),
+            Some(base as u64)
+        );
+        assert_eq!(indirect_arguments(Some((base, 27)), 0, records), None);
+        assert_eq!(
+            indirect_arguments(Some((base, 32)), 4, records),
+            Some(base as u64 + 4)
+        );
+        assert_eq!(indirect_arguments(Some((base, 31)), 4, records), None);
+        assert_eq!(indirect_arguments(Some((base, 32)), 2, records), None);
+        assert_eq!(
+            indirect_arguments(Some((base, 12)), 0, (2, 16, 1)),
+            Some(base as u64)
+        );
+        assert_eq!(
+            indirect_arguments(Some((base, 32)), 32, (2, 16, 0)),
+            Some(base as u64 + 32)
+        );
+        assert_eq!(
+            indirect_arguments(Some((base, u64::MAX)), u64::MAX - 3, records),
+            None
+        );
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

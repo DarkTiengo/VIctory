@@ -977,7 +977,7 @@ impl State {
             count_buffer,
             (kind, stride, max),
         ) {
-            why("not bounded (no clamp, no enhanced barriers, or invalid argument range)");
+            why("not bounded (no clamp or invalid argument range)");
             return false;
         }
         self.host_pipeline = 0;
@@ -995,6 +995,7 @@ impl State {
             _ => false,
         };
         if !ran {
+            crate::indirect::done(list, &args.buffer, count_buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),

@@ -19,7 +19,14 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Interface, s};
 
-use crate::host::{HostList, host};
+use crate::host::{HostList, host, transition};
+
+const COMMON_ACCESS: (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS) =
+    (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON);
+const COMPUTE_UAV: (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS) = (
+    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+);
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
@@ -185,6 +192,10 @@ pub(crate) fn byte_len(kind: u32, stride: u32, records: u32) -> Option<u64> {
 }
 
 fn enhanced_barriers() -> bool {
+    #[cfg(test)]
+    if std::env::var_os("VICTORY_TEST_LEGACY_INDIRECT").is_some() {
+        return false;
+    }
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SUPPORTED.get_or_init(|| {
         let Some(host) = host() else { return false };
@@ -200,10 +211,14 @@ fn enhanced_barriers() -> bool {
         .is_ok()
             && options.EnhancedBarriersSupported.as_bool();
         if !supported {
-            tracing::warn!("indirect execution requires enhanced buffer barriers");
+            tracing::info!("indirect execution uses legacy buffer barriers");
         }
         supported
     })
+}
+
+fn enhanced_list(list: &HostList) -> Option<ID3D12GraphicsCommandList7> {
+    enhanced_barriers().then(|| list.list.cast().ok()).flatten()
 }
 
 /// Validates the arguments in place and makes the native inputs readable.
@@ -218,7 +233,7 @@ pub(crate) fn bound(
     let Some(len) = byte_len(kind, stride, records) else {
         return false;
     };
-    if len == 0 || !offset.is_multiple_of(4) || !enhanced_barriers() {
+    if len == 0 || !offset.is_multiple_of(4) {
         return false;
     }
     // SAFETY: buffer is a live host resource.
@@ -229,21 +244,23 @@ pub(crate) fn bound(
     let Some(gpu) = gpu.checked_add(offset) else {
         return false;
     };
-    let (Some(c), Some(budget), Ok(l)) = (
-        clamp(),
-        list.budget(),
-        list.list.cast::<ID3D12GraphicsCommandList7>(),
-    ) else {
+    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
     };
-    list.use_indirect_buffers([Some(buffer), count, Some(budget)].into_iter().flatten());
+    let l = &list.list;
+    let enhanced = enhanced_list(list);
+    let separate_count = count.filter(|&count| count != buffer);
     let written = [buffer, budget];
-    let all = (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON);
-    let uav = (
-        D3D12_BARRIER_SYNC_COMPUTE_SHADING,
-        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
-    );
-    buffer_barriers(&l, written, all, uav);
+    if let Some(enhanced) = &enhanced {
+        list.use_indirect_buffers(
+            [Some(buffer), separate_count, Some(budget)]
+                .into_iter()
+                .flatten(),
+        );
+        buffer_barriers(enhanced, written, COMMON_ACCESS, COMPUTE_UAV);
+    } else {
+        uav_barrier(l);
+    }
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
@@ -255,22 +272,62 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(2, budget.GetGPUVirtualAddress());
         l.Dispatch(records.div_ceil(THREADS_PER_GROUP), 1, 1);
     }
-    buffer_barriers(&l, written, uav, all);
-    // A count in the source allocation was already synchronized above.
-    buffer_barriers(&l, count.filter(|&count| count != buffer), all, all);
+    if let Some(enhanced) = &enhanced {
+        buffer_barriers(enhanced, written, COMPUTE_UAV, COMMON_ACCESS);
+        buffer_barriers(enhanced, separate_count, COMMON_ACCESS, COMMON_ACCESS);
+    } else {
+        uav_barrier(l);
+        // Older hosts use the existing COMMON promotion/UAV convention
+        // for shadow buffers. The sanitizer leaves arguments in UAV.
+        for buffer in [Some(buffer), separate_count].into_iter().flatten() {
+            // SAFETY: an open list and live buffer.
+            unsafe {
+                l.ResourceBarrier(&[transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
+            }
+        }
+    }
     true
 }
 
 /// Finish indirect reads before later passes reuse the buffers. COMMON
 /// access leaves them available to shaders, vertex fetch, or another call.
 pub(crate) fn done(list: &HostList, args: &ID3D12Resource, count: Option<&ID3D12Resource>) {
-    let l = list
-        .list
-        .cast::<ID3D12GraphicsCommandList7>()
-        .expect("validated list");
-    let buffers = [Some(args), count.filter(|&count| count != args)];
-    let all = (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON);
-    buffer_barriers(&l, buffers.into_iter().flatten(), all, all);
+    let buffers = [Some(args), count.filter(|&count| count != args)]
+        .into_iter()
+        .flatten();
+    if let Some(enhanced) = enhanced_list(list) {
+        buffer_barriers(&enhanced, buffers, COMMON_ACCESS, COMMON_ACCESS);
+    } else {
+        for buffer in buffers {
+            // SAFETY: bound transitioned these buffers before indirect use.
+            unsafe {
+                list.list.ResourceBarrier(&[transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+        }
+    }
+}
+
+fn uav_barrier(list: &ID3D12GraphicsCommandList) {
+    // SAFETY: a global UAV barrier with no resource pointer.
+    unsafe {
+        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        }]);
+    }
 }
 
 pub(crate) fn buffer_barriers<'a>(
@@ -373,6 +430,7 @@ mod tests {
             "GPU validation adapter: {}",
             String::from_utf16_lossy(&desc.Description[..end])
         );
+        eprintln!("enhanced indirect barriers: {}", enhanced_barriers());
         assert!(clamp().is_some());
     }
 
@@ -417,6 +475,7 @@ mod tests {
                 None,
                 (kind, (4 * N) as u32, input.len() as u32)
             ));
+            done(list, &args.buffer, None);
             args
         }
 
@@ -427,15 +486,6 @@ mod tests {
                 std::slice::from_raw_parts(self.mapped.add(1).cast(), self.records).to_vec()
             }
         }
-    }
-
-    fn gpu_host() -> Option<&'static Host> {
-        let host = host()?;
-        if !enhanced_barriers() {
-            eprintln!("skipped indirect GPU test: enhanced barriers unavailable");
-            return None;
-        }
-        Some(host)
     }
 
     fn used(list: &HostList) -> u32 {
@@ -458,7 +508,7 @@ mod tests {
 
     #[test]
     fn compute_dimensions_and_resubmission() {
-        let Some(host) = gpu_host() else { return };
+        let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         let args = Arguments::record(
             host,
@@ -499,7 +549,7 @@ mod tests {
 
     #[test]
     fn compute_work_above_the_record_limit_runs_empty() {
-        let Some(host) = gpu_host() else { return };
+        let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         let args = Arguments::record(host, &list, COMPUTE, &[[1025, 1024, 1]]);
         list.close();
@@ -510,7 +560,7 @@ mod tests {
 
     #[test]
     fn rejected_reservations_cannot_wrap_the_budget() {
-        let Some(host) = gpu_host() else { return };
+        let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         let full = Arguments::record(host, &list, COMPUTE, &[FULL_DISPATCH; 2]);
         let rejected = Arguments::record(host, &list, COMPUTE, &[FULL_DISPATCH; 128]);
@@ -526,7 +576,7 @@ mod tests {
 
     #[test]
     fn rejected_reservation_leaves_room_for_smaller_dispatch() {
-        let Some(host) = gpu_host() else { return };
+        let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         let _full = Arguments::record(host, &list, COMPUTE, &[FULL_DISPATCH]);
         let _almost = Arguments::record(host, &list, COMPUTE, &[[32767, 32, 1]]);
@@ -541,7 +591,7 @@ mod tests {
 
     #[test]
     fn concurrent_reservations_stay_within_budget() {
-        let Some(host) = gpu_host() else { return };
+        let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         let args = Arguments::record(host, &list, COMPUTE, &[[128, 128, 1]; 1024]);
         list.close();
@@ -560,7 +610,7 @@ mod tests {
 
     #[test]
     fn draw_and_mesh_limits_are_preserved() {
-        let Some(host) = gpu_host() else { return };
+        let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         let draw = Arguments::record(host, &list, 0, &[[3, 2, 5, 7], [u32::MAX, u32::MAX, 9, 11]]);
         let indexed = Arguments::record(host, &list, 1, &[[6, 2, 1, u32::MAX, 2]]);
@@ -628,7 +678,7 @@ mod tests {
 
     #[test]
     fn native_dispatch_reads_the_last_record_at_the_end_of_the_buffer() {
-        let Some(host) = gpu_host() else { return };
+        let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         // Two dispatches with a 16-byte stride. From offset 4 the last
         // argument ends exactly at byte 32 of the native resource.
@@ -647,7 +697,7 @@ mod tests {
 
     #[test]
     fn cpu_count_is_reused_with_separate_and_shared_buffers() {
-        let Some(host) = gpu_host() else { return };
+        let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         let args = Arguments::new(host, &[[1, 1, 1, 1, 1, 1, 1]]);
         let count = Arguments::new(host, &[[1]]);
@@ -679,7 +729,7 @@ mod tests {
 
     #[test]
     fn gpu_count_producer_in_another_list_and_submission() {
-        let Some(host) = gpu_host() else { return };
+        let Some(host) = host() else { return };
         let writer = host.new_list().unwrap();
         let reader = host.new_list().unwrap();
         let args = Arguments::new(host, &[[1, 1, 1]; 2]);
@@ -731,7 +781,11 @@ mod tests {
 
     #[test]
     fn indirect_buffers_can_be_used_for_copies_before_and_after() {
-        let Some(host) = gpu_host() else { return };
+        if !enhanced_barriers() {
+            eprintln!("skipped copy state test: requires enhanced barriers");
+            return;
+        }
+        let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         let args = Arguments::new(host, &[[1, 1, 1]; 2]);
         let count = Arguments::new(host, &[[0]]);

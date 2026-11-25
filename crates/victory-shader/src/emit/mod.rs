@@ -118,7 +118,7 @@ pub use shader::{
     set_view_heap_limit, view_heap_limit,
 };
 
-/// The loop limit without an override: 2^20.
+/// The loop limit without an override: 2^20 ([`lower::LOOP_LIMIT`]).
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
 /// The iteration count after which a translated loop is left, per lane and
@@ -127,9 +127,10 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// `VICTORY_SHADER_LOOP_LIMIT` (decimal or `0x` hex, at least 1) overrides it
 /// in any build. A loop that hits the limit in every lane of a full-screen
 /// pass still runs for seconds (2^20 times a 4K screen is about 10^13
-/// iterations); a much lower limit shows whether such loops are what makes a
-/// frame slow. The value is part of the translation, so the shader cache keys
-/// on it (`victory-gpu`'s does).
+/// iterations, and Windows resets a card that runs past 2 s); a much lower
+/// limit shows whether such loops are what makes a frame slow. The value is
+/// part of the translation, so the shader cache keys on it (`victory-gpu`'s
+/// does).
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {

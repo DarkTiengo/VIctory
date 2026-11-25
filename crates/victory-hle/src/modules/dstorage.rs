@@ -355,6 +355,8 @@ struct Lanes {
     refused: u64,
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
+    /// Requests into physical pages.
+    pages: u64,
     since: Option<std::time::Instant>,
 }
 
@@ -412,6 +414,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     done: Default::default(),
                     refused: 0,
                     bcpack: Default::default(),
+                    pages: 0,
                     since: None,
                 }),
                 work: Condvar::new(),
@@ -472,6 +475,9 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        if job.request.options & PAGE_DESTINATION != 0 {
+            self.pages += 1;
+        }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
@@ -485,6 +491,7 @@ impl Lanes {
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                page_destinations = std::mem::take(&mut self.pages),
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
@@ -941,7 +948,8 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
-/// physical pages go through a buffer.
+/// physical pages are too when they are consecutive pages of one
+/// allocation, and otherwise go through a buffer.
 fn into_destination(
     request: &Request,
     len: usize,
@@ -950,24 +958,69 @@ fn into_destination(
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         return fill(out).map(drop);
     }
+    let offset = (request.page_offset & 0xffff) as usize;
+    // SAFETY: the title passes a page number per 64 KiB of destination,
+    // which holds at least `len` bytes from `offset`.
+    let pages = unsafe {
+        std::slice::from_raw_parts(
+            request.destination.cast::<usize>(),
+            (offset + len).div_ceil(PAGE),
+        )
+    };
+    // Consecutive pages of one allocation (the usual case): written in
+    // place through one view.
+    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+        return fill(window.bytes()).map(drop);
+    }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    let offset = (request.page_offset & 0xffff) as usize;
-    let pages = (offset + n).div_ceil(PAGE);
-    // SAFETY: the title passes a page number per 64 KiB of destination.
-    let pages = unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), pages) };
     if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        Err(E_INVALIDARG)
+        return Ok(());
     }
+    // Page number 0 is no page (numbers start at 0x10_0000): a list naming
+    // it is one the title has not filled yet. The title writes a request's
+    // page list after enqueueing it, and a queue half full is submitted on
+    // its own, so a read can start first. Read the list again for a few
+    // milliseconds before failing: the title never looks at a request's
+    // result, so a failed one is a model or texture left unwritten.
+    if pages.contains(&0) {
+        for _ in 0..LATE_LIST_TRIES {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            // SAFETY: as above; the title's list, read again.
+            let again = unsafe {
+                std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
+            };
+            if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
+                let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
+                if late.is_power_of_two() {
+                    tracing::info!(
+                        late,
+                        "dstorage: a page list filled after its request started: written late"
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
+    tracing::warn!(
+        offset,
+        len,
+        pages = pages.len(),
+        "dstorage: a destination's physical pages could not be written; its request fails"
+    );
+    Err(E_INVALIDARG)
 }
+
+/// Milliseconds a page list naming page 0 is read again for.
+const LATE_LIST_TRIES: u32 = 8;
+/// Page lists filled after their request started (written late).
+static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
 
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
 /// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
@@ -1255,6 +1308,7 @@ mod tests {
             done: Default::default(),
             refused: 0,
             bcpack: Default::default(),
+            pages: 0,
             since: None,
         }
     }
@@ -1472,5 +1526,109 @@ mod tests {
         // SAFETY: both pages are mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
+    }
+    #[test]
+    fn a_page_list_filled_after_its_request_starts() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        // The title's list, still empty when the request is submitted.
+        let list = Box::leak(Box::new([0usize; 1]));
+        let at = std::ptr::from_mut(list) as usize;
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        let number = page[0];
+        let filler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            // SAFETY: the leaked list, alive for the whole test.
+            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
+        });
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        filler.join().unwrap();
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
+    }
+    #[test]
+    fn zlib_into_pages_in_place_and_across_allocations() {
+        use crate::modules::xmem;
+        let allocate = |n: usize| {
+            let (mut pages, mut given) = (vec![0usize; n], n);
+            assert_eq!(
+                xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
+                1
+            );
+            pages
+        };
+        let (a, b) = (allocate(3), allocate(1));
+        let plain = pattern(2 * PAGE + 100);
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        // One allocation's pages in order (one window), then pages of two
+        // (through a buffer), both from 50 bytes into the first.
+        let mut destinations = [a.clone(), vec![a[0], a[1], b[0]]];
+        let (queue, array) = (new_queue(1), status_array(1));
+        for pages in &mut destinations {
+            let mut r = request(
+                ZLIB | PAGE_DESTINATION | MEMORY_SOURCE,
+                pages.as_mut_ptr().cast(),
+                plain.len(),
+                packed.as_ptr().cast(),
+                0,
+                packed.len(),
+            );
+            r.page_offset = 50;
+            enqueue(queue, &r);
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        for pages in &destinations {
+            let mapped = xmem::XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                3 * PAGE,
+                0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+                0,
+                0x04,
+            );
+            assert!(!mapped.is_null());
+            assert_eq!(
+                xmem::XMemMapPhysicalPages(mapped, 3, pages.as_ptr()),
+                mapped
+            );
+            // SAFETY: all three pages are mapped read-write.
+            let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 3 * PAGE) };
+            assert!(seen[..50].iter().all(|&b| b == 0));
+            assert_eq!(seen[50..50 + plain.len()], plain);
+            assert_eq!(
+                xmem::XMemMapPhysicalPages(mapped, 3, std::ptr::null()),
+                mapped
+            );
+        }
+        assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
+        assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
 }

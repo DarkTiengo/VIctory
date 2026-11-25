@@ -86,7 +86,11 @@ status section describes upstream, not this fork.
 
 # VIctory
 
-Runs the title (Xbox Series X|S) natively on Windows, from files
+This Linux lab fork welcomes contributions. See [CONTRIBUTING.md](CONTRIBUTING.md)
+and [the parallel task list](docs/lab/tasks.md). Linux gameplay and performance
+are unverified; the status below describes upstream's Windows results.
+
+Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies

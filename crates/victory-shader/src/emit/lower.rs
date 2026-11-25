@@ -4215,6 +4215,30 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead.
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes with that
+    /// value, take them out of EXEC) serves helper lanes too. On the host,
+    /// wave operations leave helper lanes out (DXIL before
+    /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
+    /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
+    /// loop runs to [`LOOP_LIMIT`] in every such lane: draws of 0.3 to 1.3 s
+    /// each, then DEVICE_HUNG. With its own value a helper lane matches in
+    /// the first pass and leaves; what a helper lane computes only feeds
+    /// derivatives, and its stores are dropped.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
+    }
+
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
@@ -7463,6 +7487,7 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
@@ -9055,10 +9080,12 @@ impl<'a> Lower<'a> {
                 let c = self.cur;
                 if name == "v_interp_p1ll_f16" {
                     // An f32 result from 16-bit vertex values.
-                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    let z = self.s.m.f32(0);
+                    let f = half(self, h)?.unwrap_or(z);
                     self.as_int(f)
                 } else if f16 {
-                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    let z = self.s.m.f32(0);
+                    let f = half(self, h)?.unwrap_or(z);
                     let lo = to_f16(self, f);
                     self.low_half(inst, reg, lo)
                 } else if matches!(eval, Eval::Mode(1)) {

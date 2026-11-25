@@ -116,9 +116,57 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     written_before: BTreeSet::new(),
 });
 
+/// The thread holding [`GUARDS`], or 0. The write handler runs for every
+/// write fault in the process, on the faulting thread: one that already
+/// holds the lock (a fault inside a guarded section, e.g. one the heap or
+/// Wine expects and handles itself) must not wait for it again. It did:
+/// a title thread in `Tracked::take`, holding the lock, faulted in the
+/// heap while freeing a set node, waited for its own lock in the handler,
+/// and every thread that faulted afterwards queued behind it (the title
+/// froze for good while loading the world, under Proton).
+static OWNER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn this_thread() -> u32 {
+    // SAFETY: a plain query.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+}
+
+/// Whether the calling thread holds [`GUARDS`].
+fn held_here() -> bool {
+    OWNER.load(std::sync::atomic::Ordering::Relaxed) == this_thread()
+}
+
 #[cfg(not(feature = "diagnostics"))]
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+struct Owned(std::sync::MutexGuard<'static, Guards>);
+
+#[cfg(not(feature = "diagnostics"))]
+impl std::ops::Deref for Owned {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.0
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+impl std::ops::DerefMut for Owned {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.0
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+impl Drop for Owned {
+    /// Clears the owner before the lock is released (fields drop after).
+    fn drop(&mut self) {
+        OWNER.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn guards() -> Owned {
+    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    OWNER.store(this_thread(), std::sync::atomic::Ordering::Relaxed);
+    Owned(guard)
 }
 
 /// The guard lock, timed while held by the line that took it
@@ -128,6 +176,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 fn guards() -> Held {
     let line = std::panic::Location::caller().line();
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    OWNER.store(this_thread(), std::sync::atomic::Ordering::Relaxed);
     Held(Some(guard), std::time::Instant::now(), line)
 }
 
@@ -160,6 +209,7 @@ impl Drop for Held {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         let us = self.1.elapsed().as_micros() as u64;
+        OWNER.store(0, Relaxed);
         drop(self.0.take());
         let line = u64::from(self.2);
         if let Some(slot) = HELD
@@ -617,6 +667,13 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        // A fault on the thread holding the guard lock is not one of our
+        // guarded writes being reported for the first time: waiting for the
+        // lock here would wait for ourselves. Let the next handler (the
+        // heap's, Wine's, or the crash reporter) have it.
+        if held_here() {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
         // Held across both checks: another thread may have opened the block

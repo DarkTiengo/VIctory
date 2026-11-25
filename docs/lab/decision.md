@@ -1,8 +1,26 @@
 # Development base decision
 
-Selected: [Marvisak/VIctory](https://github.com/Marvisak/VIctory), initially
-pinned at `1dd7afd4e68300e5dea41cd33a6e0b297798bb2f`. The prior XCL checkout,
-fork, build and runtime evidence remain preserved separately.
+## fxceless rendering baseline
+
+The lab integration uses fxceless/victory-fork at
+`a803c87c48078e57b296e06e08146d7ceca44530`. It carries the source history
+and the lab contribution guide and task list. Its common Marvisak/VIctory
+ancestor with the current original upstream line is `ffe310eb`. Compare
+fixes from newer Marvisak revisions individually before adopting them.
+See the [pinned fxceless baseline](https://github.com/fxceless/victory-fork/tree/a803c87c48078e57b296e06e08146d7ceca44530).
+
+The source fork reports a rendered Windows prologue, incomplete shadow
+lighting and roughly 2–4 FPS in its Windows RTX 4070 testing. The lab still
+needs to verify Proton, rendered-world correctness and the performance
+target. The two LAB-06 drafts retain their original test bases. See the
+[pinned source report](https://github.com/fxceless/victory-fork/blob/a803c87c48078e57b296e06e08146d7ceca44530/README.md)
+and [integration issue #12](https://github.com/DarkTiengo/VIctory/issues/12).
+
+## Original baseline
+
+The lab originally selected Marvisak/VIctory at
+`1dd7afd4e68300e5dea41cd33a6e0b297798bb2f`. The prior XCL checkout, fork,
+build and runtime evidence remain preserved separately.
 
 | Criterion | XCL lab evidence | VIctory evidence |
 | --- | --- | --- |

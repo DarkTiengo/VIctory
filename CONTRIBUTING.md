@@ -1,9 +1,10 @@
 # Contributing to the Linux lab fork
 
-This fork uses Marvisak/VIctory as its development base. The initial lab
-baseline is `1dd7afd4e68300e5dea41cd33a6e0b297798bb2f`. Upstream describes
-working menus on Windows, but world rendering remains black and slow. Our own Linux
-gameplay and performance remain unverified. Menu FPS is not a gameplay result.
+This branch uses the pinned fxceless rendering baseline described in
+[the lab's baseline record](docs/lab/decision.md). Marvisak/VIctory is the
+original upstream. The source fork reports that the Windows prologue renders
+with incomplete lighting and a low frame rate. The lab's Proton gameplay and
+performance remain unverified.
 
 Anyone can fork this public repository and open a pull request. Direct write
 access is granted individually by the owner; it is not required to contribute.

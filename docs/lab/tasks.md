@@ -22,6 +22,8 @@ GPU changes with LAB-06. LAB-04 and LAB-05 both touch shader lowering and must
 reserve functions before editing. LAB-06 owns host submission and resource
 lifetimes. LAB-07 owns decompression/streaming. LAB-08 owns benchmark tooling.
 
-All tasks need real validation at their layer. The current upstream describes
-a black, slow world; lifetime fixes prevent device loss in a bounded Windows run. Neither project has demonstrated our gameplay
-acceptance target. Do not treat a menu counter, a unit test or a build as proof.
+All tasks need real validation at their layer. Record the exact development
+base when comparing the earlier Marvisak runs with the pinned fxceless baseline.
+The fxceless Windows report shows a rendered prologue with incomplete lighting
+and low frame rates. The lab's Proton gameplay acceptance checks are pending.
+See the [baseline record](decision.md) before comparing results.

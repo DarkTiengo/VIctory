@@ -1176,8 +1176,82 @@ mod host {
     }
 
     #[derive(Default)]
-    pub(super) struct Host {
-        empty_until: [Option<Instant>; PADS],
+    pub(super) struct Host;
+
+    /// A pad reading older than this is treated as no pad: the XInput
+    /// worker is stuck, so the title sees a disconnected pad rather than
+    /// buttons held forever.
+    const STALE: Duration = Duration::from_millis(500);
+    /// How often the worker reads every slot.
+    const POLL: Duration = Duration::from_millis(4);
+
+    /// What the XInput worker last read, and the motor speeds asked for.
+    struct Shared {
+        pads: [Option<PadState>; PADS],
+        read_at: Option<Instant>,
+        rumble: [Option<(u16, u16)>; PADS],
+    }
+
+    static SHARED: Mutex<Shared> = Mutex::new(Shared {
+        pads: [None; PADS],
+        read_at: None,
+        rumble: [None; PADS],
+    });
+
+    /// XInput is called on one thread of ours only, never on the title's.
+    /// Wine's XInput reenumerates devices for an empty slot while holding
+    /// its global lock, and that enumeration can wait forever inside
+    /// setupapi/cfgmgr32 (seen under Proton Experimental 11 with a wired
+    /// Xbox 360 pad): every title thread that asked about a pad then waited
+    /// on that lock and the whole title stopped. Now only this worker can
+    /// get stuck; the title keeps running and its pads read as gone.
+    fn worker() {
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            let spawned = std::thread::Builder::new()
+                .name("victory-xinput".into())
+                .spawn(|| {
+                    let mut empty_until: [Option<Instant>; PADS] = [None; PADS];
+                    let mut pads: [Option<PadState>; PADS] = [None; PADS];
+                    loop {
+                        for (slot, pad) in pads.iter_mut().enumerate() {
+                            if empty_until[slot].is_some_and(|until| Instant::now() < until) {
+                                *pad = None;
+                                continue;
+                            }
+                            let mut state = XINPUT_STATE::default();
+                            // SAFETY: room for the state.
+                            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
+                                empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                                *pad = None;
+                            } else {
+                                empty_until[slot] = None;
+                                *pad = Some(convert(&state.Gamepad));
+                            }
+                        }
+                        let rumble = {
+                            let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+                            shared.pads = pads;
+                            shared.read_at = Some(Instant::now());
+                            std::mem::take(&mut shared.rumble)
+                        };
+                        for (slot, speeds) in rumble.iter().enumerate() {
+                            if let &Some((low, high)) = speeds {
+                                let speeds = XINPUT_VIBRATION {
+                                    wLeftMotorSpeed: low,
+                                    wRightMotorSpeed: high,
+                                };
+                                // SAFETY: a valid vibration; an empty slot just fails.
+                                unsafe { XInputSetState(slot as u32, &speeds) };
+                            }
+                        }
+                        std::thread::sleep(POLL);
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "no XInput worker: pads stay disconnected");
+            }
+        });
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1193,17 +1267,12 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
+            worker();
+            let shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+            match shared.read_at {
+                Some(at) if at.elapsed() < STALE => shared.pads[slot],
+                _ => None,
             }
-            let mut state = XINPUT_STATE::default();
-            // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
-                self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
-            }
-            self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1237,12 +1306,8 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
-            };
-            // SAFETY: a valid vibration; an empty slot just fails.
-            unsafe { XInputSetState(slot as u32, &speeds) };
+            worker();
+            SHARED.lock().unwrap_or_else(|e| e.into_inner()).rumble[slot] = Some((low, high));
         }
     }
 

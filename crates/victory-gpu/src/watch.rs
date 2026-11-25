@@ -460,26 +460,44 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = changed_here(g, first, last, save);
+    changed_with(g, first, last, save, open)
+}
+
+/// Saves every affected tracker's baseline before reopening any mapping.
+/// The opener is injectable so tests can write at the first read-write
+/// transition without depending on another thread winning the race.
+fn changed_with(
+    g: &mut Guards,
+    first: usize,
+    last: usize,
+    save: bool,
+    mut reopen: impl FnMut(&mut Guards, usize) -> bool,
+) -> bool {
+    let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
-    for page in others {
+    // Once any mapping is writable, another title thread can write without
+    // taking the guard lock, including through an alias. Keep them all
+    // protected until every holder has saved the bytes from before it.
+    changed_here(g, first, last, save);
+    for &page in &others {
         changed_here(g, page, page + 1, save);
     }
-    guarded
+    let was_guarded = !guarded.is_empty();
+    for page in guarded.into_iter().chain(others) {
+        reopen(g, page);
+    }
+    was_guarded
 }
 
 /// [`changed`] of `[first, last)` alone. With `save`, before the write
-/// lands: trackers armed for a page they had taken keep its bytes.
-fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for &page in &guarded {
-        open(g, page);
-    }
+/// lands: trackers armed for a page they had taken keep its bytes. Leaves
+/// protections alone until all aliases have been marked and saved too.
+fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
@@ -490,7 +508,6 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
     }
-    !guarded.is_empty()
 }
 
 /// At each presented frame (diagnostics): counts the tracked pages written
@@ -818,6 +835,70 @@ pub(crate) mod tests {
             title_memory_aliased(b + k, &[a + k]);
         }
         (a, b)
+    }
+
+    /// A competing CPU write can land as soon as either alias becomes
+    /// read-write. Every tracker, including the other alias's, must already
+    /// hold the old bytes then; saving each mapping just before opening it
+    /// still loses the other mapping's baseline.
+    #[test]
+    fn aliases_save_every_baseline_before_the_first_mapping_opens() {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+
+        let (a, b) = twin_views(1);
+        // SAFETY: a byte of our read-write mapping, before it is tracked.
+        unsafe { ((a + 7) as *mut u8).write_volatile(0x11) };
+        let trackers = [
+            track(a, PAGE, true).expect("first tracker"),
+            track(a, PAGE, true).expect("second tracker of the same mapping"),
+            track(b, PAGE, true).expect("tracker of the other mapping"),
+        ];
+        for t in &trackers {
+            assert_eq!(t.take(t.start, t.end), [(t.start, t.end)]);
+            t.arm(t.start, t.end);
+        }
+        let mut wrote = false;
+        {
+            let mut g = guards();
+            assert!(changed_with(&mut g, b / PAGE, b / PAGE + 1, true, |g, page| {
+                let opened = open(g, page);
+                if opened && !wrote {
+                    assert!(writable(page * PAGE));
+                    // SAFETY: this mapping is read-write now. A second CPU
+                    // thread could make this store without the guard lock;
+                    // the injected opener makes that interleaving certain.
+                    unsafe { ((page * PAGE + 7) as *mut u8).write_volatile(0x22) };
+                    wrote = true;
+                }
+                opened
+            }));
+        }
+        assert!(wrote, "the test writes at the first read-write transition");
+        // SAFETY: both mappings show the same committed page.
+        assert_eq!(unsafe { ((a + 7) as *const u8).read_volatile() }, 0x22);
+        for t in &trackers {
+            let saved = t.saved(t.start / PAGE).expect("baseline saved before opening either alias");
+            assert_eq!(saved[7], 0x11, "every baseline must precede the competing write");
+            assert!(t.changed(t.start / PAGE));
+        }
+
+        // A remap reports that the old bytes are already gone: save=false
+        // still marks every holder and opens every alias without a baseline.
+        for t in &trackers {
+            assert_eq!(t.take(t.start, t.end), [(t.start, t.end)]);
+            t.arm(t.start, t.end);
+        }
+        title_memory_remapped(b, PAGE);
+        for t in &trackers {
+            assert!(t.changed(t.start / PAGE));
+            assert!(t.saved(t.start / PAGE).is_none(), "remapping must not save stale bytes");
+        }
+        drop(trackers);
+        // SAFETY: these are our two mappings and no tracker still holds them.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut _ });
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut _ });
+        }
     }
 
     /// A write through another mapping of the same pages marks the tracker

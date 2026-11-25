@@ -63,6 +63,8 @@ mod texture;
 mod twin;
 #[cfg(windows)]
 mod watch;
+#[cfg(any(windows, test))]
+mod write_marks;
 
 #[cfg(windows)]
 pub use host::on_failure;

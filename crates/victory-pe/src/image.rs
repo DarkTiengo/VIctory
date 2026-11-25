@@ -442,11 +442,13 @@ mod tests {
     use super::*;
 
     /// The test binary itself is a real MSVC-linked PE32+ image.
+    #[cfg(windows)]
     fn own_image() -> Vec<u8> {
         std::fs::read(std::env::current_exe().unwrap()).unwrap()
     }
 
     #[test]
+    #[cfg(windows)]
     fn parses_own_test_binary() {
         let info = ImageInfo::parse(&own_image()).unwrap();
         assert_eq!(info.machine, MACHINE_AMD64);
@@ -467,17 +469,19 @@ mod tests {
 
     #[test]
     fn rva_to_file_offset_maps_entry_point() {
-        let data = own_image();
+        let data = synthetic_import_image();
         let info = ImageInfo::parse(&data).unwrap();
         let off = info.rva_to_file_offset(info.entry_rva).unwrap() as usize;
-        assert!(off < data.len());
+        assert_eq!(info.entry_rva, 0x10C0);
+        assert_eq!(off, 0x2C0);
+        assert_eq!(data[off], 0xC3); // the fixture's RET instruction
     }
 
     #[test]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
-        let mut info = ImageInfo::parse(&own_image()).unwrap();
+        let mut info = ImageInfo::parse(&synthetic_import_image()).unwrap();
         let rva = info.sections[0].rva + 0x20;
-        assert!(info.rva_to_file_offset(rva).is_some());
+        assert_eq!(info.rva_to_file_offset(rva), Some(0x220));
         // Used to overflow (a panic in debug builds, a wrong offset in
         // release ones).
         info.sections[0].file_offset = u32::MAX - 0x10;
@@ -488,26 +492,77 @@ mod tests {
     fn rejects_garbage_without_panicking() {
         assert!(ImageInfo::parse(b"").is_err());
         assert!(ImageInfo::parse(b"MZ not really").is_err());
-        let mut truncated = own_image();
-        truncated.truncate(0x200);
-        assert!(ImageInfo::parse(&truncated).is_err());
+        let data = synthetic_import_image();
+        ImageInfo::parse(&data).expect("baseline synthetic image must be valid");
+        // Incomplete DOS header, section header, missing section, and one
+        // byte missing from the declared raw section must all be rejected.
+        for len in [0x3F, 0x16F, 0x200, data.len() - 1] {
+            assert!(
+                ImageInfo::parse(&data[..len]).is_err(),
+                "truncation to {len:#x} bytes must be rejected"
+            );
+        }
     }
 
     #[test]
     fn rejects_iat_outside_image() {
-        let mut data = own_image();
+        let mut data = synthetic_import_image();
+        let info = ImageInfo::parse(&data).unwrap();
+        assert_eq!(info.import_count(), 2);
+        assert_eq!(info.imports[0].dll, "fixture.dll");
+        assert_eq!(
+            info.imports[0].entries[0].symbol,
+            ImportSymbol::Name {
+                hint: 3,
+                name: "FixtureImport".into(),
+            }
+        );
+        assert_eq!(info.imports[0].entries[1].symbol, ImportSymbol::Ordinal(7));
+        assert_eq!(info.imports[0].entries[0].iat_slot_rva, 0x1080);
+        assert_eq!(info.imports[0].entries[1].iat_slot_rva, 0x1088);
         let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
         let import_rva = layout::read_u32(&data, dd).unwrap();
-        let desc = ImageInfo::parse(&data)
-            .unwrap()
-            .rva_to_file_offset(import_rva)
-            .unwrap() as usize;
+        let desc = info.rva_to_file_offset(import_rva).unwrap() as usize;
         // First descriptor's FirstThunk, at the 4 GiB limit: used to overflow.
         data[desc + 16..desc + 20].copy_from_slice(&0xFFFF_FFF8u32.to_le_bytes());
         assert!(matches!(
             ImageInfo::parse(&data),
-            Err(PeError::Malformed(_))
+            Err(PeError::Malformed(message))
+                if message == "IAT at 0xfffffff8 runs outside the image"
         ));
+    }
+
+    /// A host-independent PE with a RET entry point and two imports: one
+    /// by name and one by ordinal, followed by null thunk terminators.
+    fn synthetic_import_image() -> Vec<u8> {
+        let mut body = vec![0u8; 0x200];
+        body[..4].copy_from_slice(&0x1060u32.to_le_bytes()); // OriginalFirstThunk
+        body[12..16].copy_from_slice(&0x1040u32.to_le_bytes()); // DLL name
+        body[16..20].copy_from_slice(&0x1080u32.to_le_bytes()); // FirstThunk
+        // The second, all-zero import descriptor terminates the table.
+        body[0x40..0x4C].copy_from_slice(b"fixture.dll\0");
+        for table in [0x60, 0x80] {
+            body[table..table + 8].copy_from_slice(&0x10A0u64.to_le_bytes());
+            body[table + 8..table + 16].copy_from_slice(&((1u64 << 63) | 7).to_le_bytes());
+        }
+        body[0xA0..0xA2].copy_from_slice(&3u16.to_le_bytes()); // import hint
+        body[0xA2..0xB0].copy_from_slice(b"FixtureImport\0");
+        body[0xC0] = 0xC3; // RET
+
+        let mut data = synthetic_image(&body);
+        let opt = layout::optional_header_offset(&data).unwrap();
+        let entry = opt + layout::OPT_ADDRESS_OF_ENTRY_POINT;
+        data[entry..entry + 4].copy_from_slice(&0x10C0u32.to_le_bytes());
+        let export = layout::data_directory_offset(&data, 0).unwrap();
+        data[export..export + layout::DATA_DIRECTORY_SIZE].fill(0);
+        let import = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
+        data[import..import + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[import + 4..import + 8].copy_from_slice(&40u32.to_le_bytes());
+        // One executable section holds both code and import metadata.
+        let sec = opt + 240;
+        data[sec..sec + 8].copy_from_slice(b".text\0\0\0");
+        data[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+        data
     }
     /// A minimal PE32+ image: one section at RVA 0x1000 holding `body`, with
     /// the export directory (RVA 0x1000, 0x80 bytes) pointing at it.

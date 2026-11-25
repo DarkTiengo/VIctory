@@ -3,6 +3,7 @@
 This Linux lab fork welcomes contributions. See [CONTRIBUTING.md](CONTRIBUTING.md)
 and [the parallel task list](docs/lab/tasks.md). Linux gameplay and performance
 are unverified; the status below describes upstream's Windows results.
+For Windows builds under Linux, see [the Proton lab launcher](docs/lab/proton.md).
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.

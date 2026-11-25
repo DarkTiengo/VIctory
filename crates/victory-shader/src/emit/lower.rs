@@ -195,7 +195,10 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// Annotated handles by block, descriptor load and both property words:
+    /// the second word is the component type, so an image read as floats
+    /// and updated by integer atomics gets two handles.
+    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -253,6 +256,9 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// The program's one `ret` block, which every lane leaving the program
+    /// branches to (see [`Self::ret_block`]).
+    ret: Option<usize>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
@@ -643,6 +649,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            ret: None,
             round16: round16(p),
             mode16: Some(0),
         }
@@ -4781,7 +4788,7 @@ impl<'a> Lower<'a> {
         }
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -9343,7 +9350,7 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
-                Term::Ret
+                Term::Br(self.ret_block())
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
@@ -9389,9 +9396,26 @@ impl<'a> Lower<'a> {
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
+        let ret = self.ret_block();
+        self.s.m.terminate(a, Term::Br(ret));
         self.abort = Some(a);
         a
+    }
+
+    /// The program's single exit block. DXC leaves a function through one
+    /// `ret`; a loop whose only ways out are separate `ret` blocks (the
+    /// program's end inside the loop, the [`LOOP_LIMIT`] stop) has no exit
+    /// block for DXIL-to-SPIR-V structurizers to merge at. vkd3d-proton's
+    /// dxil-spirv then emits an unterminated merge block (invalid SPIR-V
+    /// that crashed the NVIDIA driver) or fails an assertion.
+    fn ret_block(&mut self) -> usize {
+        if let Some(r) = self.ret {
+            return r;
+        }
+        let r = self.s.m.new_block();
+        self.s.m.terminate(r, Term::Ret);
+        self.ret = Some(r);
+        r
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.

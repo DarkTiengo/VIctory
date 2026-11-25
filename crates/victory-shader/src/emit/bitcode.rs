@@ -496,11 +496,28 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    /// Whether body instruction `i` must be written though nothing reads
+    /// it: stores, atomics and calls of functions that are not `readnone`
+    /// or `readonly`. A pure instruction nothing reads is dropped: the
+    /// NVIDIA driver (615.78) crashes compiling SPIR-V that keeps unused
+    /// image queries (`getDimensions` results), and DXC never emits them.
+    fn has_effect(&self, i: u32) -> bool {
+        match &self.insts[i as usize].op {
+            Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
+            Op::Call(f, _) => !matches!(
+                self.funcs[*f as usize].attr,
+                Some(Attr::ReadNone | Attr::ReadOnly)
+            ),
+            _ => false,
+        }
+    }
+
     /// The module as bitcode.
-    /// Which instructions are written: every body instruction, the branch
-    /// conditions, and whatever they read, transitively (a phi nothing reads
-    /// is dropped). A worklist visits each instruction once, so a long chain
-    /// of merges costs one pass, not one pass per merge.
+    /// Which instructions are written: body instructions with effects, the
+    /// branch conditions, and whatever they read, transitively (a phi or a
+    /// pure instruction nothing reads is dropped). A worklist visits each
+    /// instruction once, so a long chain of merges costs one pass, not one
+    /// pass per merge.
     fn live(&self) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
@@ -513,7 +530,7 @@ impl Module {
             }
         };
         for b in &self.blocks {
-            for &i in &b.body {
+            for &i in b.body.iter().filter(|&&i| self.has_effect(i)) {
                 mark(&mut live, &mut work, V::Inst(i));
             }
             if let Some(Term::CondBr(c, ..)) = b.term {
@@ -705,7 +722,7 @@ impl Module {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
                 blk.term,
-                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
+                blk.phis.iter().chain(&blk.body).all(|&i| !live[i as usize]),
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
@@ -727,7 +744,7 @@ impl Module {
         let mut ids = vec![u32::MAX; self.insts.len()];
         let mut next = base;
         for b in layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
+            for &i in b.phis.iter().chain(&b.body).filter(|&&i| live[i as usize]) {
                 if !self.is_void(self.insts[i as usize].ty) {
                     ids[i as usize] = next;
                     next += 1;
@@ -809,7 +826,7 @@ impl Module {
         // The operands of variable-length records, reused across them.
         let mut r: Vec<u64> = Vec::new();
         for b in layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
+            for &i in b.phis.iter().chain(&b.body).filter(|&&i| live[i as usize]) {
                 let inst = &self.insts[i as usize];
                 let rel = |v: V| {
                     let a = abs(v);
@@ -1111,7 +1128,7 @@ mod tests {
     fn live_by_passes(m: &Module) -> Vec<bool> {
         let mut live = vec![false; m.insts.len()];
         for b in &m.blocks {
-            for &i in &b.body {
+            for &i in b.body.iter().filter(|&&i| m.has_effect(i)) {
                 live[i as usize] = true;
             }
             if let Some(Term::CondBr(V::Inst(c), ..)) = b.term {
@@ -1150,6 +1167,9 @@ mod tests {
     fn unread_phis_are_dropped() {
         let mut m = Module::default();
         let i32t = m.int(32);
+        let void = m.void();
+        let fty = m.func_ty(void, vec![i32t]);
+        let sink = m.function("sink", fty, Some(Attr::NoUnwind), false);
         let (entry, join) = (m.new_block(), m.new_block());
         let (a, b) = (m.i32(1), m.i32(2));
         m.terminate(entry, Term::Br(join));
@@ -1163,6 +1183,8 @@ mod tests {
         m.set_phi(cyc_a, vec![(cyc_b, entry)]);
         m.set_phi(cyc_b, vec![(cyc_a, entry)]);
         let sum = m.bin(join, Bin::Add, read, b);
+        // Read by a call with effects; an unread pure `sum` would be dropped.
+        let _ = m.call(join, sink, vec![sum]);
         m.terminate(join, Term::Ret);
         let ids = |v: V| match v {
             V::Inst(i) => i as usize,
@@ -1226,8 +1248,11 @@ mod tests {
     #[test]
     fn written_bytes_unchanged() {
         for ((regs, stages, read), len, hash) in [
-            ((64, 64, 64), 38_916, 0x9586_730c_f953_4a45),
-            ((128, 256, 32), 295_952, 0x89e5_de2d_64f0_8785),
+            // Re-pinned when unread pure instructions (here the synthetic
+            // `readnone` calls whose results no phi carries on) stopped being
+            // written.
+            ((64, 64, 64), 19_160, 0x9668_d522_c416_b7ba),
+            ((128, 256, 32), 220_912, 0x4051_0340_204a_9143),
         ] {
             let bytes = synthetic(regs, stages, read).write();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");

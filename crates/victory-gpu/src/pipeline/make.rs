@@ -71,6 +71,8 @@ impl Pending {
     fn make(&self) {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(shaders = ?self.shaders, "making pipeline");
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
@@ -249,6 +251,15 @@ fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        // Diagnostics: `VICTORY_PIPELINE_WORKERS=1` makes one pipeline at a
+        // time, so the last "making pipeline" line before a host driver
+        // crash names the pipeline it crashed on.
+        #[cfg(feature = "diagnostics")]
+        let n = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&w| w >= 1)
+            .unwrap_or(n);
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()

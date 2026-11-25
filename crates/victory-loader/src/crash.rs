@@ -447,6 +447,33 @@ unsafe fn thrown(p: &[usize]) -> String {
     }
 }
 
+/// The reports written so far, as (from the unhandled filter, code, faulting
+/// address).
+///
+/// One fault can be dispatched more than once, from more than one thread:
+/// a title that asserts in a pool allocator several threads are inside
+/// reaches the same `int3` in each, and the unhandled-exception filter of
+/// each then wrote its own copy of the same twelve lines (six copies for one
+/// breakpoint in the first prologue run, all at the same second and address,
+/// which is how the first failure of a run gets buried). One full report is
+/// written per kind of report about one fault; the dispatches after it are
+/// one line.
+static REPORTED: std::sync::Mutex<Vec<(bool, i32, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether this report (`unhandled`, `code` at `at`) has not been written
+/// yet. `true` when another thread holds [`REPORTED`]: a fault inside this
+/// handler must still be reported rather than dropped.
+fn first_time(unhandled: bool, code: i32, at: usize) -> bool {
+    let Ok(mut seen) = REPORTED.try_lock() else {
+        return true;
+    };
+    if seen.contains(&(unhandled, code, at)) {
+        return false;
+    }
+    seen.push((unhandled, code, at));
+    true
+}
+
 /// # Safety
 /// See [`report_unhandled`].
 unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
@@ -454,6 +481,20 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     let (record, context) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
     let code = record.ExceptionCode;
     let at = record.ExceptionAddress as usize;
+    if !first_time(to_file, code, at) {
+        // The same fault again: one line, so that the report that says what
+        // failed first stays findable.
+        let line = format!(
+            "VIctory: {what} {:#010x} at {} again (the same fault, reported above; no stack)",
+            code as u32,
+            locate(at)
+        );
+        eprintln!("{line}");
+        if to_file {
+            append_to_log(&line);
+        }
+        return;
+    }
     let p = record.ExceptionInformation;
     let detail = if code == EXCEPTION_ACCESS_VIOLATION {
         let kind = match p[0] {
@@ -664,6 +705,71 @@ mod tests {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
+
+    #[test]
+    fn one_fault_is_reported_once_per_kind() {
+        // A pool allocator several threads are inside reaches the same
+        // `int3` in each; the filter of each wrote the whole report again
+        // (six copies of one breakpoint in the first prologue run).
+        let at = 0x1406_3966f;
+        let code = 0x8000_0003_u32 as i32;
+        assert!(first_time(true, code, at), "the first report is written whole");
+        assert!(!first_time(true, code, at), "the same fault again is one line");
+        assert!(!first_time(true, code, at));
+        assert!(first_time(false, code, at), "first-chance and unhandled are different reports");
+        assert!(first_time(true, code, at + 1), "another address is another report");
+        assert!(first_time(true, code + 1, at), "another code is another report");
+    }
+
+    /// In a child process of the next test: one fault, dispatched by the
+    /// unhandled-exception filter three times (as several threads of a title
+    /// stuck in a pool allocator's `int3` each do), with the crash log where
+    /// `VICTORY_CRASH_LOG_TEST` says.
+    #[test]
+    fn repeated_fault_child() {
+        let Some(log) = std::env::var_os("VICTORY_CRASH_LOG_TEST") else {
+            return;
+        };
+        log_crashes_to(log.into());
+        // The system's pointers for an exception we make up: the record's
+        // address is this function, so `locate` names our own module.
+        #[repr(C, align(16))]
+        struct Aligned(CONTEXT);
+        // SAFETY: zeroed is a valid CONTEXT; `RtlCaptureContext` writes it.
+        let mut context = Aligned(unsafe { std::mem::zeroed() });
+        // SAFETY: writes the 16-byte aligned context it is given.
+        unsafe { RtlCaptureContext(&mut context.0) };
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = EXCEPTION_BREAKPOINT;
+        record.ExceptionAddress = repeated_fault_child as *mut core::ffi::c_void;
+        let pointers = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: &mut context.0,
+        };
+        // SAFETY: the pointers above live for all three calls and hold an
+        // exception and a context of ours.
+        unsafe {
+            for _ in 0..3 {
+                report_unhandled(&pointers);
+            }
+        }
+    }
+
+    #[test]
+    fn one_fault_is_in_the_crash_log_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("crashes.log");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash::tests::repeated_fault_child", "--nocapture"])
+            .env("VICTORY_CRASH_LOG_TEST", &log)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let whole = text.matches("rsp 0x").count();
+        let again = text.matches("again (the same fault").count();
+        assert_eq!((whole, again), (1, 2), "crash log: {text}");
+    }
 
     #[test]
     #[inline(never)]
